@@ -25,9 +25,9 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y curl unzip p7zip-full file
-          # cài libc++ để .so prebuilt (nếu link libc++) có thể dlopen trên host
+          # libc++ để phòng .so prebuilt link libc++
           sudo apt-get install -y libc++-14-dev libc++abi-14-dev || true
-          # cài host llvm/clang 14 để dump plugin options
+          # host LLVM14 để dump options
           sudo apt-get install -y llvm-14 llvm-14-tools clang-14
 
       - name: Download prebuilt libSsageObfuscator.so (upstream)
@@ -45,7 +45,7 @@ jobs:
           ls -l plugin
           file plugin/libSsageObfuscator.so || true
 
-      # --- PIN NDK r25c; nếu action lỗi 404, fallback tải tay ---
+      # --- NDK r25c; nếu action lỗi, fallback tải tay ---
       - name: Setup NDK r25c (preferred)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
@@ -78,33 +78,47 @@ jobs:
           fi
           "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
 
-      # ===== Dump plugin options để bạn gửi lại (ưu tiên host opt-14) =====
-      - name: Dump plugin options via opt-14 (-load-pass-plugin -help)
+      # ===== Dump plugin options (KHÔNG fail job) =====
+
+      - name: Dump plugin options via opt-14 (with dummy bitcode)
         id: dump_opts_opt
-        continue-on-error: true
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
-          /usr/bin/opt-14 -load-pass-plugin="$PLUGIN" -help 2>&1 | tee plugin-opts-opt14.txt
-          test -s plugin-opts-opt14.txt || exit 1
+          # tạo dummy module để ép opt nạp plugin đúng cách
+          cat > dummy.ll <<'EOF'
+          ; ModuleID = 'dummy'
+          source_filename = "dummy"
+          define void @f() { ret void }
+          EOF
+          # chạy opt-14 với plugin + no-op pipeline + -help, luôn exit 0
+          ( /usr/bin/opt-14 -load-pass-plugin="$PLUGIN" \
+              -disable-output -passes=verify dummy.ll \
+              -o /dev/null -help || true ) \
+            2>&1 | tee plugin-opts-opt14.txt
+          # đảm bảo có file artifacts, kể cả khi rỗng
+          test -f plugin-opts-opt14.txt || touch plugin-opts-opt14.txt
+          # thêm strings để tham khảo nhanh (không bắt buộc)
+          strings "$PLUGIN" | grep -i -E '(fla|split|bcf|mba|fw|flatten|bogus|indirect)' || true | tee -a plugin-opts-opt14.txt
 
       - name: Fallback dump via clang++-14 (-mllvm -help with plugin loaded)
-        if: steps.dump_opts_opt.outcome != 'success'
+        if: always()  # luôn chạy, nhưng không làm fail
         id: dump_opts_clang
-        continue-on-error: true
+        shell: bash
         run: |
           set -euxo pipefail
           PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
-          # nạp plugin (legacy-load để registry nhận cl::opt), rồi in help
           echo 'int x;' | \
             clang++-14 -x c++ - -c -o /dev/null \
               -fpass-plugin="$PLUGIN" \
               -Xclang -load -Xclang "$PLUGIN" \
               -mllvm -help 2>&1 | tee plugin-opts-clang14.txt
-          test -s plugin-opts-clang14.txt || exit 1
+          test -f plugin-opts-clang14.txt || touch plugin-opts-clang14.txt
+        continue-on-error: true
 
-      # ===== Test MAX (ổn định): bật pass qua annotation + knobs -mllvm =====
-      - name: NDK compile test – MAX tuned (annotations + knobs, NEW PM only, -O0)
+      # ===== Test MAX (ổn định): annotation + knobs (NEW PM only, -O0) =====
+      - name: NDK compile test — MAX tuned (annotations + knobs, NEW PM only, -O0)
         id: test_max
         run: |
           set -euxo pipefail
@@ -134,8 +148,8 @@ jobs:
           "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
           file libtest_max.so || true
 
-      # ===== Fallback nếu Flattening vẫn nhạy: bỏ fla, giữ phần còn lại =====
-      - name: NDK compile test – MAX-no-fla (annotations + knobs, NEW PM only, -O0)
+      # ===== Fallback nếu Flattening nhạy: bỏ fla, giữ phần còn lại =====
+      - name: NDK compile test — MAX-no-fla (annotations + knobs, NEW PM only, -O0)
         if: steps.test_max.outcome != 'success'
         run: |
           set -euxo pipefail
@@ -165,7 +179,7 @@ jobs:
           "$CXX" --target=aarch64-linux-android31 test_max_nofla.o -shared -o libtest_max_nofla.so
           file libtest_max_nofla.so || true
 
-      - name: Upload artifacts (please send back plugin-opts*.txt)
+      - name: Upload artifacts (send me plugin-opts*.txt)
         uses: actions/upload-artifact@v4
         with:
           name: ndk-prebuilt-test-strong-and-opts
