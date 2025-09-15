@@ -122,11 +122,11 @@ jobs:
           cat > test_max_nofla.cpp <<'EOF'
           #include <cstdio>
           __attribute__((noinline))
-          __attribute((__annotate__(("split strenc bcf mba funcwrap"))))
+          __attribute((__annotate__(("split strenc bcf mba funcwrap vmf"))))
           static void ultra(){ std::puts("NDK MAX no-fla"); }
 
           __attribute__((noinline))
-          __attribute((__annotate__(("split strenc bcf mba funcwrap"))))
+          __attribute((__annotate__(("split strenc bcf mba funcwrap vmf"))))
           static void ultra2(){ std::puts("NDK MAX no-fla 2"); }
 
           int main(){ ultra(); ultra2(); return 0; }
@@ -161,8 +161,6 @@ jobs:
             -Xclang -load -Xclang "$PLUGIN" \
             -mllvm -split_num=8 \
             -mllvm -bcf_prob=100 \
-            -mllvm -fla_times=2 \
-            -mllvm -mba=1 \
             -c "$SRC" -o test_max_tuned.o || true
 
           "$CXX" --target=aarch64-linux-android31 test_max_tuned.o -shared -o libtest_max_tuned.so || true
