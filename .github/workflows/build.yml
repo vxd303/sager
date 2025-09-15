@@ -88,11 +88,11 @@ jobs:
           cat > test_max.cpp <<'EOF'
           #include <cstdio>
           __attribute__((noinline))
-          __attribute((__annotate__(("fla split strenc bcf mba funcwrap"))))
+          __attribute((__annotate__(("fla split strenc bcf mba funcwrap vmf"))))
           static void ultra(){ std::puts("NDK MAX obf (stable)"); }
 
           __attribute__((noinline))
-          __attribute((__annotate__(("fla split strenc bcf mba funcwrap"))))
+          __attribute((__annotate__(("fla split strenc bcf mba funcwrap vmf"))))
           static void ultra2(){ std::puts("NDK MAX obf 2 (stable)"); }
 
           int main(){ ultra(); ultra2(); return 0; }
@@ -159,8 +159,10 @@ jobs:
           "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN" \
-            -mllvm -split_num=8 \
-            -mllvm -bcf_prob=100 \
+            -mllvm -split_num=7 \
+            -mllvm -bcf_prob=100 -mllvm -bcf_loop=3 -mllvm -bcf_cond_compl=5 \
+            -mllvm -fw_prob=100 -mllvm -fw_times=4 \
+
             -c "$SRC" -o test_max_tuned.o || true
 
           "$CXX" --target=aarch64-linux-android31 test_max_tuned.o -shared -o libtest_max_tuned.so || true
