@@ -89,6 +89,12 @@ jobs:
               -disable-output -passes=verify dummy.ll \
               -o /dev/null -help || true ) 2>&1 | tee plugin-opts-opt14.txt
           test -f plugin-opts-opt14.txt || touch plugin-opts-opt14.txt
+          echo "== print passes from plugin via opt-14 =="
+          opt-14 --load-pass-plugin=plugin/libSsageObfuscator.so --print-passes || true
+
+              echo "== grep symbols from .so =="
+             nm -D plugin/libSsageObfuscator.so | c++filt | grep -Ei 'Pass|Flatten|Obfus|Bogus|MBA|String|Indirect|VM' || true
+
 
       - name: Fallback dump via clang++-14 (-mllvm -help with legacy-load)
         if: always()
