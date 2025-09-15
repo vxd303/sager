@@ -8,9 +8,8 @@ on:
 permissions: { contents: read }
 
 env:
-  # Repo gốc để clone; đổi sang fork/nhánh của bạn nếu muốn.
   SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
-  SSAGEPASS_REF: ""   # ví dụ: "refs/heads/master" hoặc SHA; để trống = mặc định
+  SSAGEPASS_REF: ""   # có thể đặt refs/heads/master hoặc SHA cố định nếu muốn pin
 
 jobs:
   build-and-ndk-smoke:
@@ -20,15 +19,14 @@ jobs:
       - name: Checkout (your repo – contains this workflow)
         uses: actions/checkout@v4
 
-      - name: Install LLVM/Clang 14 + libc++
+      - name: Install LLVM/Clang 14
         shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build \
-            llvm-14-dev clang-14 clang-tools-14 lld-14 \
-            libc++-14-dev libc++abi-14-dev git
+            llvm-14-dev clang-14 clang-tools-14 lld-14 git
           echo "LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> "$GITHUB_ENV"
           echo "CC=clang-14" >> "$GITHUB_ENV"
           echo "CXX=clang++-14" >> "$GITHUB_ENV"
@@ -48,18 +46,6 @@ jobs:
           echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
           echo "Tree depth=2 for debug:"; find . -maxdepth 2 -print
 
-      # (Tùy chọn) Nếu muốn dùng demo.sh của tác giả, bỏ comment step dưới:
-      # - name: Try demo.sh (optional)
-      #   shell: bash
-      #   working-directory: ${{ steps.clone.outputs.src_dir }}
-      #   continue-on-error: true
-      #   run: |
-      #     set -euxo pipefail
-      #     if [ -f ./demo.sh ]; then
-      #       chmod +x ./demo.sh
-      #       ./demo.sh
-      #     fi
-
       - name: Detect CMakeLists (prefer target SsageObfuscator)
         id: detect_dir
         shell: bash
@@ -73,7 +59,6 @@ jobs:
               BUILD_DIR="$d"; break
             fi
           done
-          # fallback: lấy CMakeLists đầu tiên
           if [ -z "$BUILD_DIR" ] && [ ${#CANDS[@]} -gt 0 ]; then
             BUILD_DIR="${CANDS[0]}"
           fi
@@ -82,7 +67,7 @@ jobs:
           echo "Detected build_dir: $BUILD_DIR"
           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,120p'
 
-      - name: Patch CMakeLists (remove AOSP hardcoded paths)
+      - name: Patch CMakeLists (remove AOSP hardcoded paths & libc++)
         shell: bash
         run: |
           set -euo pipefail
@@ -97,22 +82,21 @@ jobs:
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# patched by CI|g' \
             "$D/CMakeLists.txt" || true
 
-          # Đổi include hardcode sang LLVM14/libc++ hệ thống
+          # Gỡ các include/flags libc++ để dùng mặc định libstdc++ của host
           sed -i -E \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1|/usr/include/c++/v1|g' \
+            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1||g' \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
+            -e 's|-stdlib=libc\+\+||g' \
             "$D/CMakeLists.txt" || true
 
-          # Đảm bảo C++14 + libc++
+          # Bảo đảm C++14 (nếu file chưa set)
           grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || \
             printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
-          grep -q '\-stdlib=libc\+\+' "$D/CMakeLists.txt" || \
-            printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
 
           echo "==== Patched $D/CMakeLists.txt ===="
           nl -ba "$D/CMakeLists.txt" | sed -n '1,160p'
 
-      - name: Configure (LLVM 14)
+      - name: Configure (LLVM 14, default libstdc++)
         shell: bash
         env:
           LLVM_DIR: ${{ env.LLVM_DIR }}
@@ -126,9 +110,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER="${CC}" \
             -DCMAKE_CXX_COMPILER="${CXX}" \
-            -DCMAKE_CXX_STANDARD=14 \
-            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++"
+            -DCMAKE_CXX_STANDARD=14
 
       - name: Build
         shell: bash
@@ -144,7 +126,7 @@ jobs:
           echo "plugin=$f" >> "$GITHUB_OUTPUT"
           ls -l "$f"
 
-      - name: Smoke test (host clang++-14)
+      - name: Smoke test (host clang++-14, no -mllvm first)
         shell: bash
         run: |
           set -euxo pipefail
@@ -155,11 +137,23 @@ jobs:
           int main(){ secret(); return 0; }
           EOF
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          # NEW PM load + legacy load để đảm bảo register pass
           clang++-14 smoke.cpp -O2 -o smoke.app \
+            -fpass-plugin="$PLUGIN" \
+            -Xclang -load -Xclang "$PLUGIN"
+          ./smoke.app || true
+
+      - name: (Optional) Try with -mllvm split_num (do not fail CI)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          clang++-14 smoke.cpp -O2 -o smoke.split \
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN" \
             -mllvm -split_num=3
-          ./smoke.app || true
+          ./smoke.split || true
 
       - name: Setup NDK r25c
         uses: nttld/setup-ndk@v1
@@ -184,7 +178,6 @@ jobs:
           "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN" \
-            -mllvm -split_num=3 \
             -c test.cpp -o test.o
 
           "$CXX" --target=aarch64-linux-android31 test.o -shared -o libtest.so
@@ -198,6 +191,7 @@ jobs:
             ${{ steps.find_plugin.outputs.plugin }}
             smoke.cpp
             smoke.app
+            smoke.split
             test.cpp
             test.o
             libtest.so
