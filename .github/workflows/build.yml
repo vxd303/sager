@@ -10,7 +10,7 @@ permissions: { contents: read }
 
 env:
   SSAGE_SO_URL: https://github.com/SsageParuders/SsagePass/releases/download/1.0/libSsageObfuscator.so
-  SSAGE_SO_SHA256: ""  # điền nếu muốn verify
+  SSAGE_SO_SHA256: ""
 
 jobs:
   ndk-test:
@@ -25,12 +25,10 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y curl unzip p7zip-full file
-          # libc++ để phòng .so prebuilt link libc++
           sudo apt-get install -y libc++-14-dev libc++abi-14-dev || true
-          # host LLVM14 để dump options
           sudo apt-get install -y llvm-14 llvm-14-tools clang-14
 
-      - name: Download prebuilt libSsageObfuscator.so (upstream)
+      - name: Download prebuilt libSsageObfuscator.so
         id: fetch_so
         run: |
           set -euxo pipefail
@@ -42,7 +40,6 @@ jobs:
           fi
           chmod a+r plugin/libSsageObfuscator.so
           echo "plugin=$(pwd)/plugin/libSsageObfuscator.so" >> "$GITHUB_OUTPUT"
-          ls -l plugin
           file plugin/libSsageObfuscator.so || true
 
       # --- NDK r25c; nếu action lỗi, fallback tải tay ---
@@ -54,21 +51,19 @@ jobs:
           add-to-path: true
         continue-on-error: true
 
-      - name: Fallback: download NDK r25c from official link
+      - name: Fallback:download NDK r25c from official link
         if: steps.setup-ndk.outcome != 'success'
         run: |
           set -euxo pipefail
           mkdir -p "$HOME/ndk"
           cd "$HOME/ndk"
-          curl -L -o android-ndk-r25c-linux.zip \
-            https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          curl -L -o android-ndk-r25c-linux.zip https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
           unzip -q android-ndk-r25c-linux.zip
           echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
           echo "NDK=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
           echo "$HOME/ndk/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Verify NDK clang (expect LLVM 14.x)
-        id: ndk_ver
+      - name: Verify NDK clang (LLVM 14.x expected)
         run: |
           set -euxo pipefail
           if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
@@ -78,32 +73,25 @@ jobs:
           fi
           "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
 
-      # ===== Dump plugin options (KHÔNG fail job) =====
-
-      - name: Dump plugin options via opt-14 (with dummy bitcode)
+      # ===== Dump plugin options (không fail job) =====
+      - name: Dump plugin options via opt-14 (dummy bitcode)
         id: dump_opts_opt
         shell: bash
         run: |
           set -euo pipefail
           PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
-          # tạo dummy module để ép opt nạp plugin đúng cách
           cat > dummy.ll <<'EOF'
           ; ModuleID = 'dummy'
           source_filename = "dummy"
           define void @f() { ret void }
           EOF
-          # chạy opt-14 với plugin + no-op pipeline + -help, luôn exit 0
           ( /usr/bin/opt-14 -load-pass-plugin="$PLUGIN" \
               -disable-output -passes=verify dummy.ll \
-              -o /dev/null -help || true ) \
-            2>&1 | tee plugin-opts-opt14.txt
-          # đảm bảo có file artifacts, kể cả khi rỗng
+              -o /dev/null -help || true ) 2>&1 | tee plugin-opts-opt14.txt
           test -f plugin-opts-opt14.txt || touch plugin-opts-opt14.txt
-          # thêm strings để tham khảo nhanh (không bắt buộc)
-          strings "$PLUGIN" | grep -i -E '(fla|split|bcf|mba|fw|flatten|bogus|indirect)' || true | tee -a plugin-opts-opt14.txt
 
-      - name: Fallback dump via clang++-14 (-mllvm -help with plugin loaded)
-        if: always()  # luôn chạy, nhưng không làm fail
+      - name: Fallback dump via clang++-14 (-mllvm -help with legacy-load)
+        if: always()
         id: dump_opts_clang
         shell: bash
         run: |
@@ -117,9 +105,9 @@ jobs:
           test -f plugin-opts-clang14.txt || touch plugin-opts-clang14.txt
         continue-on-error: true
 
-      # ===== Test MAX (ổn định): annotation + knobs (NEW PM only, -O0) =====
-      - name: NDK compile test — MAX tuned (annotations + knobs, NEW PM only, -O0)
-        id: test_max
+      # ===== BASE: annotations ONLY (NEW PM, không -mllvm) =====
+      - name: NDK compile — BASE (annotations only, -O0)
+        id: test_base
         run: |
           set -euxo pipefail
           PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
@@ -130,27 +118,24 @@ jobs:
           fi
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
 
-          cat > test_max.cpp <<'EOF'
+          cat > test_base.cpp <<'EOF'
           #include <cstdio>
           __attribute__((noinline))
           __attribute((__annotate__(("fla split strenc bcf mba funcwrap"))))
-          static void ultra(){ std::puts("NDK MAX tuned"); }
+          static void ultra(){ std::puts("NDK BASE"); }
           int main(){ ultra(); return 0; }
           EOF
 
           "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
-            -mllvm -split_num=7 \
-            -mllvm -bcf_prob=100 -mllvm -bcf_loop=3 -mllvm -bcf_cond_compl=5 \
-            -mllvm -fw_prob=100  -mllvm -fw_times=4 \
-            -c test_max.cpp -o test_max.o
+            -c test_base.cpp -o test_base.o
 
-          "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
-          file libtest_max.so || true
+          "$CXX" --target=aarch64-linux-android31 test_base.o -shared -o libtest_base.so
+          file libtest_base.so || true
 
-      # ===== Fallback nếu Flattening nhạy: bỏ fla, giữ phần còn lại =====
-      - name: NDK compile test — MAX-no-fla (annotations + knobs, NEW PM only, -O0)
-        if: steps.test_max.outcome != 'success'
+      # ===== TUNED: nạp kép + -mllvm (đây là chỗ trước bị "unknown") =====
+      - name: NDK compile — TUNED (double-load + -mllvm, -O0)
+        id: test_tuned
         run: |
           set -euxo pipefail
           PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
@@ -161,25 +146,58 @@ jobs:
           fi
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
 
-          cat > test_max_nofla.cpp <<'EOF'
+          cat > test_tuned.cpp <<'EOF'
           #include <cstdio>
           __attribute__((noinline))
-          __attribute((__annotate__(("split strenc bcf mba funcwrap"))))
-          static void ultra(){ std::puts("NDK MAX no-fla"); }
+          __attribute((__annotate__(("fla split strenc bcf mba funcwrap"))))
+          static void ultra(){ std::puts("NDK TUNED"); }
           int main(){ ultra(); return 0; }
           EOF
 
           "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
+            -Xclang -load -Xclang "$PLUGIN" \
             -mllvm -split_num=7 \
             -mllvm -bcf_prob=100 -mllvm -bcf_loop=3 -mllvm -bcf_cond_compl=5 \
             -mllvm -fw_prob=100  -mllvm -fw_times=4 \
-            -c test_max_nofla.cpp -o test_max_nofla.o
+            -c test_tuned.cpp -o test_tuned.o
 
-          "$CXX" --target=aarch64-linux-android31 test_max_nofla.o -shared -o libtest_max_nofla.so
-          file libtest_max_nofla.so || true
+          "$CXX" --target=aarch64-linux-android31 test_tuned.o -shared -o libtest_tuned.so
+          file libtest_tuned.so || true
 
-      - name: Upload artifacts (send me plugin-opts*.txt)
+      # ===== Fallback: nếu Flattening nhạy, bỏ fla =====
+      - name: NDK compile — TUNED-no-fla (double-load + -mllvm, -O0)
+        if: failure() && steps.test_base.outcome == 'success'
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
+          cat > test_tuned_nofla.cpp <<'EOF'
+          #include <cstdio>
+          __attribute__((noinline))
+          __attribute((__annotate__(("split strenc bcf mba funcwrap"))))
+          static void ultra(){ std::puts("NDK TUNED no-fla"); }
+          int main(){ ultra(); return 0; }
+          EOF
+
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
+            -fpass-plugin="$PLUGIN" \
+            -Xclang -load -Xclang "$PLUGIN" \
+            -mllvm -split_num=7 \
+            -mllvm -bcf_prob=100 -mllvm -bcf_loop=3 -mllvm -bcf_cond_compl=5 \
+            -mllvm -fw_prob=100  -mllvm -fw_times=4 \
+            -c test_tuned_nofla.cpp -o test_tuned_nofla.o
+
+          "$CXX" --target=aarch64-linux-android31 test_tuned_nofla.o -shared -o libtest_tuned_nofla.so
+          file libtest_tuned_nofla.so || true
+
+      - name: Upload artifacts (gửi mình plugin-opts*.txt)
         uses: actions/upload-artifact@v4
         with:
           name: ndk-prebuilt-test-strong-and-opts
@@ -187,9 +205,12 @@ jobs:
             plugin/libSsageObfuscator.so
             plugin-opts-opt14.txt
             plugin-opts-clang14.txt
-            test_max.cpp
-            test_max.o
-            libtest_max.so
-            test_max_nofla.cpp
-            test_max_nofla.o
-            libtest_max_nofla.so
+            test_base.cpp
+            test_base.o
+            libtest_base.so
+            test_tuned.cpp
+            test_tuned.o
+            libtest_tuned.so
+            test_tuned_nofla.cpp
+            test_tuned_nofla.o
+            libtest_tuned_nofla.so
