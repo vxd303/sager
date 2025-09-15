@@ -28,7 +28,7 @@ jobs:
           # Ninja, CMake, git, tiện ích
           sudo apt-get install -y ninja-build cmake git curl file
           # libc++ cho -stdlib=libc++
-          sudo apt-get install -y libc++-14-dev libc++abi-14-dev
+          sudo apt-get install -y libc++-14-dev libc++abi-14-dev || true
 
       - name: Set toolchain env (host)
         run: |
@@ -48,21 +48,36 @@ jobs:
             git fetch origin "${SSAGEPASS_REF}" && git checkout FETCH_HEAD
           fi
           echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
+          echo "Repo tree (depth 2):"
           find . -maxdepth 2 -print
 
-      - name: Detect Obfuscation/CMakeLists
+      - name: Detect Obfuscation/CMakeLists (FIXED v2)
         id: detect
+        shell: bash
         run: |
-          set -euo pipefail
-          SRC="${{ steps.clone.outputs.src_dir }}"
-          if [ -f "$SRC/Obfuscation/CMakeLists.txt" ]; then
-            echo "build_dir=$SRC/Obfuscation" >> "$GITHUB_OUTPUT"
-          else
-            mapfile -t CANDS < <(find "$SRC" -type f -name CMakeLists.txt -printf '%h\n' | sort -u)
-            test ${#CANDS[@]} -gt 0 || { echo "::error::No CMakeLists found"; exit 1; }
-            echo "build_dir=${CANDS[0]}" >> "$GITHUB_OUTPUT"
+         set -euxo pipefail
+         SRC="${{ steps.clone.outputs.src_dir }}"
+         BUILD_DIR=""
+         if [ -f "$SRC/Obfuscation/CMakeLists.txt" ]; then
+         BUILD_DIR="$SRC/Obfuscation"
+         else
+         # Tìm CMakeLists.txt bất kỳ và lấy thư mục đầu tiên
+         readarray -t CANDS < <(find "$SRC" -type f -name CMakeLists.txt -printf '%h\n' | sort -u)
+         if [ "${#CANDS[@]}" -gt 0 ]; then
+         BUILD_DIR="${CANDS[0]}"
+         fi
           fi
-          nl -ba "${{ steps.detect.outputs.build_dir }}/CMakeLists.txt" | sed -n '1,180p'
+
+          # Kiểm tra và in ra để debug
+         test -n "$BUILD_DIR" || { echo "::error::No CMakeLists found in repo"; exit 1; }
+         echo "Found build dir: $BUILD_DIR"
+
+          # DÙNG BIẾN CỤC BỘ để in nội dung CMakeLists (đừng dùng outputs ngay trong step này)
+           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
+
+          # Xuất cho các step SAU dùng
+           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
+
 
       - name: Patch CMakeLists (un-hardcode; use libc++; C++14)
         run: |
@@ -77,17 +92,15 @@ jobs:
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# [CI] patched|' \
             "$D/CMakeLists.txt" || true
 
-          # Bật libc++ & chuẩn hoá std=c++14
-          if ! grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt"; then
-            printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
-          fi
+          # Bật libc++ & std=c++14
+          grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
           if ! grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt"; then
             printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
           else
             sed -i 's/CMAKE_CXX_FLAGS[^"]*"/& -stdlib=libc++/;' "$D/CMakeLists.txt" || true
           fi
 
-          # Nếu có include hardcode tới ndk-llvm cũ -> thay bằng headers hệ thống LLVM 14
+          # Thay include path hardcode nếu có
           sed -i -E \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1|/usr/include/c++/v1|g' \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
