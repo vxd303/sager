@@ -1,0 +1,157 @@
+name: build-ssagepass
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-llvm14:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install LLVM/Clang 14 and build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build \
+            llvm-14-dev clang-14 clang-tools-14 lld-14
+
+          # Tham chiếu CMake package path của LLVM/Clang 14
+          echo "LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> $GITHUB_ENV
+          echo "CLANG_DIR=/usr/lib/llvm-14/lib/cmake/clang" >> $GITHUB_ENV
+          echo "CC=clang-14" >> $GITHUB_ENV
+          echo "CXX=clang++-14" >> $GITHUB_ENV
+
+      - name: Configure (robust):try root, then Obfuscation/
+        run: |
+          set -e
+          if [ -f CMakeLists.txt ]; then
+            cmake -S . -B build -G Ninja \
+              -DLLVM_DIR="${LLVM_DIR}" \
+              -DCLANG_DIR="${CLANG_DIR}" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=${CC} \
+              -DCMAKE_CXX_COMPILER=${CXX}
+          elif [ -f Obfuscation/CMakeLists.txt ]; then
+            cmake -S Obfuscation -B build -G Ninja \
+              -DLLVM_DIR="${LLVM_DIR}" \
+              -DCLANG_DIR="${CLANG_DIR}" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=${CC} \
+              -DCMAKE_CXX_COMPILER=${CXX}
+          else
+            echo "No CMakeLists.txt found at repo root or Obfuscation/"; exit 1
+          fi
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Locate built plugin
+        id: find_plugin
+        run: |
+          set -e
+          f=$(find build -maxdepth 3 -type f -name "*SsageObfus*.so" -o -name "*SsageObfuscator*.so" | head -n1 || true)
+          if [ -z "$f" ]; then
+            echo "Plugin .so not found in build/"; find build -maxdepth 3 -type f -printf '%P\n'; exit 1
+          fi
+          echo "plugin=$f" >> $GITHUB_OUTPUT
+          ls -l "$f"
+
+      - name: Smoke test:load plugin with clang++-14
+        run: |
+          set -e
+          mkdir -p smoke
+          cat > smoke/smoke.cpp <<'EOF'
+          #include <cstdio>
+          // Bật pass theo README (NEW PM đọc annotation để bật): ví dụ fla + split + strenc
+          __attribute((__annotate__(("fla split strenc"))))
+          static void secret() { std::puts("hello"); }
+          int main(){ secret(); return 0; }
+          EOF
+
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          # Dự phòng: NEW PM nhận plugin qua -fpass-plugin. Nếu cần truyền cl::opt (vd. -split_num),
+          # tạm thời dùng thêm legacy -Xclang -load theo README.
+          clang++-14 smoke/smoke.cpp -O2 -o smoke/app \
+            -fpass-plugin="$PLUGIN" \
+            -Xclang -load -Xclang "$PLUGIN" \
+            -mllvm -split_num=3
+
+          file "$PLUGIN" || true
+          ./smoke/app || true
+
+      - name: Upload artifacts (plugin + smoke)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssagepass-artifacts
+          path: |
+            ${{ steps.find_plugin.outputs.plugin }}
+            smoke/app
+            smoke/smoke.cpp
+
+  # (TÙY CHỌN) Test với NDK r25c để đảm bảo clang của NDK cũng load được plugin.
+  # Lưu ý: phải khớp ABI/LLVM major, nếu lệch có thể lỗi undefined symbol.
+  android-ndk-r25c-smoke:
+    needs: build-linux-llvm14
+    runs-on: ubuntu-22.04
+    continue-on-error: true  # bật để không làm fail CI nếu NDK clang không khớp ABI
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download plugin artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ssagepass-artifacts
+          path: out
+
+      - name: Setup NDK r25c
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      - name: NDK clang++ smoke build (aarch64)
+        shell: bash
+        run: |
+          set -e
+          NDK="$ANDROID_NDK_HOME"
+          echo "NDK at: $NDK"
+          cat > smoke_ndk.cpp <<'EOF'
+          #include <cstdio>
+          __attribute((__annotate__(("fla split"))))
+          static void f(){ std::puts("ndk"); }
+          int main(){ f(); return 0; }
+          EOF
+
+          # Tìm plugin .so tải về
+          PLUGIN=$(find out -type f -name "*SsageObfus*.so" -o -name "*SsageObfuscator*.so" | head -n1)
+          test -n "$PLUGIN"
+
+          # Dùng toolchain r25c (clang 14.x) để compile cho Android; chỉ smoke compile, không chạy.
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" \
+            --target=aarch64-linux-android31 \
+            -fuse-ld=lld \
+            -fPIC \
+            -O2 \
+            smoke_ndk.cpp -o app-arm64 \
+            -fpass-plugin="$PLUGIN" \
+            -Xclang -load -Xclang "$PLUGIN" \
+            -mllvm -split_num=3
+
+          file app-arm64 || true
+
+      - name: Upload NDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ndk-smoke
+          path: app-arm64
