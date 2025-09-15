@@ -7,12 +7,17 @@ on:
 
 permissions: { contents: read }
 
+env:
+  # Repo gốc để clone; đổi sang fork/nhánh của bạn nếu muốn.
+  SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
+  SSAGEPASS_REF: ""   # ví dụ: "refs/heads/master" hoặc SHA; để trống = mặc định
+
 jobs:
   build-and-ndk-smoke:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout
+      - name: Checkout (your repo – contains this workflow)
         uses: actions/checkout@v4
 
       - name: Install LLVM/Clang 14 + libc++
@@ -23,44 +28,68 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build \
             llvm-14-dev clang-14 clang-tools-14 lld-14 \
-            libc++-14-dev libc++abi-14-dev
+            libc++-14-dev libc++abi-14-dev git
           echo "LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> "$GITHUB_ENV"
           echo "CC=clang-14" >> "$GITHUB_ENV"
           echo "CXX=clang++-14" >> "$GITHUB_ENV"
 
-      - name: Detect pass directory (CMakeLists + SsageObfuscator)
+      - name: Clone upstream SsagePass
+        id: clone
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p third_party
+          cd third_party
+          git clone --depth=1 "${SSAGEPASS_REPO}" SsagePass
+          cd SsagePass
+          if [ -n "${SSAGEPASS_REF}" ]; then
+            git fetch origin "${SSAGEPASS_REF}" && git checkout FETCH_HEAD
+          fi
+          echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
+          echo "Tree depth=2 for debug:"; find . -maxdepth 2 -print
+
+      # (Tùy chọn) Nếu muốn dùng demo.sh của tác giả, bỏ comment step dưới:
+      # - name: Try demo.sh (optional)
+      #   shell: bash
+      #   working-directory: ${{ steps.clone.outputs.src_dir }}
+      #   continue-on-error: true
+      #   run: |
+      #     set -euxo pipefail
+      #     if [ -f ./demo.sh ]; then
+      #       chmod +x ./demo.sh
+      #       ./demo.sh
+      #     fi
+
+      - name: Detect CMakeLists (prefer target SsageObfuscator)
         id: detect_dir
         shell: bash
         run: |
           set -euo pipefail
-          echo "Repo tree (depth 2) for debugging:"
-          find . -maxdepth 2 -type d -print
-
-          # tìm mọi CMakeLists.txt theo git index
-          mapfile -t CANDIDATES < <(git ls-files | grep -i 'CMakeLists\.txt$' | xargs -n1 dirname | sort -u)
+          SRC="${{ steps.clone.outputs.src_dir }}"
+          mapfile -t CANDS < <(find "$SRC" -type f -name 'CMakeLists.txt' -printf '%h\n' | sort -u)
           BUILD_DIR=""
-          for d in "${CANDIDATES[@]}"; do
+          for d in "${CANDS[@]}"; do
             if grep -Eiq 'add_library\s*\(\s*SsageObfuscator' "$d/CMakeLists.txt"; then
-              BUILD_DIR="$d"
-              break
+              BUILD_DIR="$d"; break
             fi
           done
-          # Fallback: nếu không match target, lấy CMakeLists đầu tiên
-          if [ -z "$BUILD_DIR" ] && [ ${#CANDIDATES[@]} -gt 0 ]; then
-            BUILD_DIR="${CANDIDATES[0]}"
+          # fallback: lấy CMakeLists đầu tiên
+          if [ -z "$BUILD_DIR" ] && [ ${#CANDS[@]} -gt 0 ]; then
+            BUILD_DIR="${CANDS[0]}"
           fi
-          test -n "$BUILD_DIR" || { echo "::error::No CMakeLists.txt found"; exit 1; }
+          test -n "$BUILD_DIR" || { echo "::error::No CMakeLists.txt found in cloned repo"; exit 1; }
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-          echo "Detected build_dir = $BUILD_DIR"
+          echo "Detected build_dir: $BUILD_DIR"
+          nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,120p'
 
-      - name: Patch CMakeLists (remove hardcoded AOSP paths)
+      - name: Patch CMakeLists (remove AOSP hardcoded paths)
         shell: bash
         run: |
           set -euo pipefail
           D="${{ steps.detect_dir.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
 
-          # Bỏ set() hardcode compiler/LLVM_HOME/LLVM_DIR (không có cũng OK)
+          # Bỏ set() hardcode compiler/LLVM paths (nếu có)
           sed -i -E \
             -e 's|^set\(CMAKE_C_COMPILER .*$|# patched by CI|g' \
             -e 's|^set\(CMAKE_CXX_COMPILER .*$|# patched by CI|g' \
@@ -68,20 +97,20 @@ jobs:
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# patched by CI|g' \
             "$D/CMakeLists.txt" || true
 
-          # Chuyển include path hardcode sang hệ thống LLVM 14 / libc++
+          # Đổi include hardcode sang LLVM14/libc++ hệ thống
           sed -i -E \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1|/usr/include/c++/v1|g' \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
             "$D/CMakeLists.txt" || true
 
-          # Đảm bảo dùng C++14 + libc++
-          grep -q -- 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || \
+          # Đảm bảo C++14 + libc++
+          grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || \
             printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
-          grep -q -- '-stdlib=libc\+\+' "$D/CMakeLists.txt" || \
+          grep -q '\-stdlib=libc\+\+' "$D/CMakeLists.txt" || \
             printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
 
           echo "==== Patched $D/CMakeLists.txt ===="
-          nl -ba "$D/CMakeLists.txt"
+          nl -ba "$D/CMakeLists.txt" | sed -n '1,160p'
 
       - name: Configure (LLVM 14)
         shell: bash
@@ -126,7 +155,6 @@ jobs:
           int main(){ secret(); return 0; }
           EOF
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          # NEW PM + "nạp kép" để truyền cl::opt
           clang++-14 smoke.cpp -O2 -o smoke.app \
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN" \
