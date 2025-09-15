@@ -9,7 +9,7 @@ permissions: { contents: read }
 
 env:
   SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
-  SSAGEPASS_REF: ""   # pin SHA/nhánh nếu muốn
+  SSAGEPASS_REF: ""
 
 jobs:
   build-and-ndk-smoke:
@@ -23,12 +23,8 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # LLVM/Clang 14 host + dev (có CMake package)
           sudo apt-get install -y llvm-14 llvm-14-dev llvm-14-tools clang-14
-          # Ninja, CMake, git, tiện ích
           sudo apt-get install -y ninja-build cmake git curl file
-          # libc++ cho -stdlib=libc++
-          sudo apt-get install -y libc++-14-dev libc++abi-14-dev || true
 
       - name: Set toolchain env (host)
         run: |
@@ -55,56 +51,38 @@ jobs:
         id: detect
         shell: bash
         run: |
-         set -euxo pipefail
-         SRC="${{ steps.clone.outputs.src_dir }}"
-         BUILD_DIR=""
-         if [ -f "$SRC/Obfuscation/CMakeLists.txt" ]; then
-         BUILD_DIR="$SRC/Obfuscation"
-         else
-         # Tìm CMakeLists.txt bất kỳ và lấy thư mục đầu tiên
-         readarray -t CANDS < <(find "$SRC" -type f -name CMakeLists.txt -printf '%h\n' | sort -u)
-         if [ "${#CANDS[@]}" -gt 0 ]; then
-         BUILD_DIR="${CANDS[0]}"
-         fi
+          set -euxo pipefail
+          SRC="${{ steps.clone.outputs.src_dir }}"
+          BUILD_DIR=""
+          if [ -f "$SRC/Obfuscation/CMakeLists.txt" ]; then
+            BUILD_DIR="$SRC/Obfuscation"
+          else
+            readarray -t CANDS < <(find "$SRC" -type f -name CMakeLists.txt -printf '%h\n' | sort -u)
+            if [ "${#CANDS[@]}" -gt 0 ]; then
+              BUILD_DIR="${CANDS[0]}"
+            fi
           fi
+          test -n "$BUILD_DIR" || { echo "::error::No CMakeLists found in repo"; exit 1; }
+          echo "Found build dir: $BUILD_DIR"
+          nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
+          echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
 
-          # Kiểm tra và in ra để debug
-         test -n "$BUILD_DIR" || { echo "::error::No CMakeLists found in repo"; exit 1; }
-         echo "Found build dir: $BUILD_DIR"
-
-          # DÙNG BIẾN CỤC BỘ để in nội dung CMakeLists (đừng dùng outputs ngay trong step này)
-           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
-
-          # Xuất cho các step SAU dùng
-           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-
-
-      - name: Patch CMakeLists (un-hardcode; use libc++; C++14)
+      - name: Patch CMakeLists (drop hardcodes; use default libstdc++; C++14)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
-          # Bỏ các hardcode compiler/ENV của tác giả
+          # Bỏ hardcode compiler/ENV trong repo gốc
           sed -i -E \
             -e 's|^set\(CMAKE_C_COMPILER .*$|# [CI] patched|' \
             -e 's|^set\(CMAKE_CXX_COMPILER .*$|# [CI] patched|' \
             -e 's|^set\(ENV\{LLVM_HOME\} .*$|# [CI] patched|' \
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# [CI] patched|' \
             "$D/CMakeLists.txt" || true
-
-          # Bật libc++ & std=c++14
+          # Gỡ mọi ép -stdlib=libc++ nếu có (để dùng libstdc++ mặc định)
+          sed -i -E 's|-stdlib=libc\+\+||g' "$D/CMakeLists.txt" || true
+          # Đảm bảo C++14
           grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
-          if ! grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt"; then
-            printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
-          else
-            sed -i 's/CMAKE_CXX_FLAGS[^"]*"/& -stdlib=libc++/;' "$D/CMakeLists.txt" || true
-          fi
-
-          # Thay include path hardcode nếu có
-          sed -i -E \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1|/usr/include/c++/v1|g' \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
-            "$D/CMakeLists.txt" || true
 
       - name: Configure (host LLVM 14 CMake)
         env:
@@ -119,9 +97,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER="${CC}" \
             -DCMAKE_CXX_COMPILER="${CXX}" \
-            -DCMAKE_CXX_STANDARD=14 \
-            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++"
+            -DCMAKE_CXX_STANDARD=14
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -131,9 +107,11 @@ jobs:
         run: |
           set -e
           f=$(find build -type f -name "*SsageObfuscator*.so" -o -name "SsageObfuscator.so" | head -n1 || true)
-          test -n "$f" || { echo "::error::plugin .so not found"; find build -maxdepth 2 -type f -printf '%p\n'; exit 1; }
+          test -n "$f" || { echo "::error::plugin .so not found"; find build -maxdepth 3 -type f -printf '%p\n'; exit 1; }
           echo "plugin=$f" >> "$GITHUB_OUTPUT"
           ls -l "$f" && file "$f"
+          echo "== ldd on plugin =="
+          ldd "$f" || true
 
       - name: Smoke test (host clang-14, NEW PM)
         run: |
@@ -148,7 +126,7 @@ jobs:
           clang++-14 smoke.cpp -O2 -o smoke.app -fpass-plugin="$PLUGIN"
           ./smoke.app || true
 
-      # ---------- Tuỳ chọn: thử load bằng NDK r25c (không làm fail job) ----------
+      # (Optional) NDK thử tải — không fail job
       - name: Setup NDK r25c
         id: setup-ndk
         uses: nttld/setup-ndk@v1
@@ -180,17 +158,13 @@ jobs:
           fi
           CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-
           cat > ndk_test.cpp <<'EOF'
           #include <cstdio>
           __attribute((__annotate__(("fla split strenc"))))
           static void f(){ std::puts("NDK compile OK"); }
           int main(){ f(); return 0; }
           EOF
-
-          "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
-            -fpass-plugin="$PLUGIN" \
-            -c ndk_test.cpp -o ndk_test.o || true
+          "$CXX" --target=aarch64-linux-android31 -O2 -fPIC -fpass-plugin="$PLUGIN" -c ndk_test.cpp -o ndk_test.o || true
           "$CXX" --target=aarch64-linux-android31 ndk_test.o -shared -o libndk_test.so || true
           file libndk_test.so || true
 
