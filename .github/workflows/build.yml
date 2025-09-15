@@ -1,4 +1,5 @@
-name: build-ssagepass-with-ndk
+name: build-ssagepass
+
 on:
   push: { branches: [ main, master ] }
   pull_request:
@@ -7,75 +8,130 @@ on:
 permissions: { contents: read }
 
 jobs:
-  build-plugin-llvm14:
+  build-and-ndk-smoke:
     runs-on: ubuntu-22.04
-    outputs:
-      plugin: ${{ steps.find_plugin.outputs.plugin }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install LLVM/Clang 14 + libc++
+        shell: bash
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build \
             llvm-14-dev clang-14 clang-tools-14 lld-14 \
             libc++-14-dev libc++abi-14-dev
-          echo "LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> $GITHUB_ENV
-          echo "CC=clang-14" >> $GITHUB_ENV
-          echo "CXX=clang++-14" >> $GITHUB_ENV
+          echo "LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "CC=clang-14" >> "$GITHUB_ENV"
+          echo "CXX=clang++-14" >> "$GITHUB_ENV"
 
-      - name: Build via CMake in Obfuscation/ (patch hardcoded paths)
-        working-directory: Obfuscation
+      - name: Detect pass directory (CMakeLists + SsageObfuscator)
+        id: detect_dir
+        shell: bash
         run: |
-          set -euxo pipefail
-          # Un-hardcode các đường dẫn AOSP trong CMakeLists.txt như bạn đã show
-          sed -i -E \
-            -e 's|^set\(CMAKE_C_COMPILER .*$|# patched|' \
-            -e 's|^set\(CMAKE_CXX_COMPILER .*$|# patched|' \
-            -e 's|^set\(ENV\{LLVM_HOME\} .*$|# patched|' \
-            -e 's|^set\(ENV\{LLVM_DIR\} .*$|# patched|' \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\\+\\+/v1|/usr/include/c++/v1|g' \
-            CMakeLists.txt
+          set -euo pipefail
+          echo "Repo tree (depth 2) for debugging:"
+          find . -maxdepth 2 -type d -print
 
-          cmake -S . -B ../build -G Ninja \
+          # tìm mọi CMakeLists.txt theo git index
+          mapfile -t CANDIDATES < <(git ls-files | grep -i 'CMakeLists\.txt$' | xargs -n1 dirname | sort -u)
+          BUILD_DIR=""
+          for d in "${CANDIDATES[@]}"; do
+            if grep -Eiq 'add_library\s*\(\s*SsageObfuscator' "$d/CMakeLists.txt"; then
+              BUILD_DIR="$d"
+              break
+            fi
+          done
+          # Fallback: nếu không match target, lấy CMakeLists đầu tiên
+          if [ -z "$BUILD_DIR" ] && [ ${#CANDIDATES[@]} -gt 0 ]; then
+            BUILD_DIR="${CANDIDATES[0]}"
+          fi
+          test -n "$BUILD_DIR" || { echo "::error::No CMakeLists.txt found"; exit 1; }
+          echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
+          echo "Detected build_dir = $BUILD_DIR"
+
+      - name: Patch CMakeLists (remove hardcoded AOSP paths)
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="${{ steps.detect_dir.outputs.build_dir }}"
+          cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
+
+          # Bỏ set() hardcode compiler/LLVM_HOME/LLVM_DIR (không có cũng OK)
+          sed -i -E \
+            -e 's|^set\(CMAKE_C_COMPILER .*$|# patched by CI|g' \
+            -e 's|^set\(CMAKE_CXX_COMPILER .*$|# patched by CI|g' \
+            -e 's|^set\(ENV\{LLVM_HOME\} .*$|# patched by CI|g' \
+            -e 's|^set\(ENV\{LLVM_DIR\} .*$|# patched by CI|g' \
+            "$D/CMakeLists.txt" || true
+
+          # Chuyển include path hardcode sang hệ thống LLVM 14 / libc++
+          sed -i -E \
+            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1|/usr/include/c++/v1|g' \
+            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
+            "$D/CMakeLists.txt" || true
+
+          # Đảm bảo dùng C++14 + libc++
+          grep -q -- 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || \
+            printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
+          grep -q -- '-stdlib=libc\+\+' "$D/CMakeLists.txt" || \
+            printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
+
+          echo "==== Patched $D/CMakeLists.txt ===="
+          nl -ba "$D/CMakeLists.txt"
+
+      - name: Configure (LLVM 14)
+        shell: bash
+        env:
+          LLVM_DIR: ${{ env.LLVM_DIR }}
+          CC: ${{ env.CC }}
+          CXX: ${{ env.CXX }}
+        run: |
+          set -euo pipefail
+          D="${{ steps.detect_dir.outputs.build_dir }}"
+          cmake -S "$D" -B build -G Ninja \
             -DLLVM_DIR="${LLVM_DIR}" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=${CC} \
-            -DCMAKE_CXX_COMPILER=${CXX} \
+            -DCMAKE_C_COMPILER="${CC}" \
+            -DCMAKE_CXX_COMPILER="${CXX}" \
             -DCMAKE_CXX_STANDARD=14 \
             -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
             -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++"
 
-          cmake --build ../build -j"$(nproc)"
+      - name: Build
+        shell: bash
+        run: cmake --build build -j"$(nproc)"
 
-      - name: Find plugin
+      - name: Locate built plugin
         id: find_plugin
+        shell: bash
         run: |
           set -e
-          f=$(find build -type f -name "*SsageObfuscator*.so" | head -n1 || true)
-          test -n "$f" || { echo "::error::plugin .so not found"; find build -type f -maxdepth 2; exit 1; }
-          echo "plugin=$f" >> $GITHUB_OUTPUT
+          f=$(find build -type f -name "*SsageObfuscator*.so" -o -name "SsageObfuscator.so" | head -n1 || true)
+          test -n "$f" || { echo "::error::plugin .so not found"; find build -maxdepth 2 -type f -printf '%p\n'; exit 1; }
+          echo "plugin=$f" >> "$GITHUB_OUTPUT"
           ls -l "$f"
 
-      - name: Upload plugin
-        uses: actions/upload-artifact@v4
-        with:
-          name: ssagepass-plugin
-          path: ${{ steps.find_plugin.outputs.plugin }}
-
-  ndk-smoke-test:
-    needs: build-plugin-llvm14
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download plugin
-        uses: actions/download-artifact@v4
-        with:
-          name: ssagepass-plugin
-          path: out
+      - name: Smoke test (host clang++-14)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > smoke.cpp <<'EOF'
+          #include <cstdio>
+          __attribute((__annotate__(("fla split strenc"))))
+          static void secret(){ std::puts("hello"); }
+          int main(){ secret(); return 0; }
+          EOF
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          # NEW PM + "nạp kép" để truyền cl::opt
+          clang++-14 smoke.cpp -O2 -o smoke.app \
+            -fpass-plugin="$PLUGIN" \
+            -Xclang -load -Xclang "$PLUGIN" \
+            -mllvm -split_num=3
+          ./smoke.app || true
 
       - name: Setup NDK r25c
         uses: nttld/setup-ndk@v1
@@ -83,13 +139,13 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      - name: Show NDK clang version
-        run: |
-          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
-
-      - name: NDK compile test (host runs plugin, target = Android)
+      - name: NDK compile test (plugin runs on host, target Android)
+        shell: bash
         run: |
           set -euxo pipefail
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
           cat > test.cpp <<'EOF'
           #include <cstdio>
           __attribute((__annotate__(("fla split strenc"))))
@@ -97,25 +153,25 @@ jobs:
           int main(){ f(); return 0; }
           EOF
 
-          PLUGIN=$(find out -type f -name "*SsageObfuscator*.so" | head -n1)
-          test -n "$PLUGIN"
-
-          CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
-          # Quan trọng: plugin chạy ở HOST khi compile, còn output nhắm Android.
           "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN" \
             -mllvm -split_num=3 \
-            test.cpp -c -o test.o
+            -c test.cpp -o test.o
 
-          # Link thành ELF cho Android để đảm bảo compile pipeline hoàn tất
           "$CXX" --target=aarch64-linux-android31 test.o -shared -o libtest.so
+          file libtest.so || true
 
-      - name: Upload NDK smoke artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ndk-smoke
+          name: ssagepass-artifacts
           path: |
+            ${{ steps.find_plugin.outputs.plugin }}
+            smoke.cpp
+            smoke.app
             test.cpp
             test.o
             libtest.so
+            ${{ steps.detect_dir.outputs.build_dir }}/CMakeLists.txt
+            ${{ steps.detect_dir.outputs.build_dir }}/CMakeLists.txt.orig
