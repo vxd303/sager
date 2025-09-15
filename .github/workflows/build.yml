@@ -9,7 +9,7 @@ permissions: { contents: read }
 
 env:
   SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
-  SSAGEPASS_REF: ""   # có thể đặt refs/heads/master hoặc SHA cố định nếu muốn pin
+  SSAGEPASS_REF: ""   # tùy chọn: refs/heads/master hoặc SHA để pin commit
 
 jobs:
   build-and-ndk-smoke:
@@ -19,7 +19,7 @@ jobs:
       - name: Checkout (your repo – contains this workflow)
         uses: actions/checkout@v4
 
-      - name: Install LLVM/Clang 14
+      - name: Install LLVM/Clang 14 (host)
         shell: bash
         run: |
           set -euxo pipefail
@@ -44,7 +44,7 @@ jobs:
             git fetch origin "${SSAGEPASS_REF}" && git checkout FETCH_HEAD
           fi
           echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
-          echo "Tree depth=2 for debug:"; find . -maxdepth 2 -print
+          find . -maxdepth 2 -print
 
       - name: Detect CMakeLists (prefer target SsageObfuscator)
         id: detect_dir
@@ -64,17 +64,16 @@ jobs:
           fi
           test -n "$BUILD_DIR" || { echo "::error::No CMakeLists.txt found in cloned repo"; exit 1; }
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-          echo "Detected build_dir: $BUILD_DIR"
           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,120p'
 
-      - name: Patch CMakeLists (remove AOSP hardcoded paths & libc++)
+      - name: Patch CMakeLists (remove AOSP hardcoded paths)
         shell: bash
         run: |
           set -euo pipefail
           D="${{ steps.detect_dir.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
 
-          # Bỏ set() hardcode compiler/LLVM paths (nếu có)
+          # Bỏ hardcode compiler/LLVM env
           sed -i -E \
             -e 's|^set\(CMAKE_C_COMPILER .*$|# patched by CI|g' \
             -e 's|^set\(CMAKE_CXX_COMPILER .*$|# patched by CI|g' \
@@ -82,21 +81,20 @@ jobs:
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# patched by CI|g' \
             "$D/CMakeLists.txt" || true
 
-          # Gỡ các include/flags libc++ để dùng mặc định libstdc++ của host
+          # Xóa flags/include libc++ để dùng libstdc++ (khớp clang host & NDK r25c)
           sed -i -E \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1||g' \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
             -e 's|-stdlib=libc\+\+||g' \
             "$D/CMakeLists.txt" || true
 
-          # Bảo đảm C++14 (nếu file chưa set)
           grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || \
             printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
 
           echo "==== Patched $D/CMakeLists.txt ===="
           nl -ba "$D/CMakeLists.txt" | sed -n '1,160p'
 
-      - name: Configure (LLVM 14, default libstdc++)
+      - name: Configure (host LLVM 14)
         shell: bash
         env:
           LLVM_DIR: ${{ env.LLVM_DIR }}
@@ -137,36 +135,32 @@ jobs:
           int main(){ secret(); return 0; }
           EOF
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          # NEW PM load + legacy load để đảm bảo register pass
           clang++-14 smoke.cpp -O2 -o smoke.app \
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN"
           ./smoke.app || true
 
-      - name: (Optional) Try with -mllvm split_num (do not fail CI)
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -euxo pipefail
-          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          clang++-14 smoke.cpp -O2 -o smoke.split \
-            -fpass-plugin="$PLUGIN" \
-            -Xclang -load -Xclang "$PLUGIN" \
-            -mllvm -split_num=3
-          ./smoke.split || true
-
-      - name: Setup NDK r25c
+      - name: Setup NDK r25c (pin exact version)
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r25c
+          ndk-version: 25.2.9519653   # r25c
           add-to-path: true
+
+      - name: Verify NDK clang version (must be 14.0.6)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
 
       - name: NDK compile test (plugin runs on host, target Android)
         shell: bash
         run: |
           set -euxo pipefail
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          CXX="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
 
           cat > test.cpp <<'EOF'
           #include <cstdio>
@@ -191,7 +185,6 @@ jobs:
             ${{ steps.find_plugin.outputs.plugin }}
             smoke.cpp
             smoke.app
-            smoke.split
             test.cpp
             test.o
             libtest.so
