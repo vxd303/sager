@@ -108,7 +108,7 @@ jobs:
           file libtest_max.so || true
 
       # ---------- THỬ "MẠNH NHẤT" QUA -mllvm (tùy chọn, không làm fail) ----------
-      - name: Optional: try legacy-style tuning flags (-mllvm), ignore failures
+      - name: Optional:try legacy-style tuning flags (-mllvm), ignore failures
         continue-on-error: true
         run: |
           set -euxo pipefail
