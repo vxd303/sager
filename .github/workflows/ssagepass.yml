@@ -1,14 +1,19 @@
 name: build-ssagepass-ndk
 
 on:
-  push: { branches: [ main, master ] }
+  push:
+    branches:
+      - main  # Chỉ nhận sự kiện push từ nhánh main
   pull_request:
+    branches:
+      - main  # Chỉ nhận sự kiện pull request từ nhánh main
   workflow_dispatch:
 
-permissions: { contents: read }
+permissions:
+  contents: read
 
 env:
-  SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
+  SSAGEPASS_REPO: https://github.com/lux-QAQ/SsagePass.git
   SSAGEPASS_REF: ""   # có thể pin SHA/nhánh nếu muốn
 
 jobs:
@@ -26,24 +31,27 @@ jobs:
           sudo apt-get install -y llvm-14 llvm-14-dev llvm-14-tools clang-14
           sudo apt-get install -y libc++1-14 libc++abi1-14 libc++-14-dev libc++abi-14-dev
           sudo apt-get install -y ninja-build cmake git curl file
+
       - name: Set host toolchain env
         run: |
           set -euxo pipefail
           echo "HOST_LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> "$GITHUB_ENV"
           echo "CC=clang-14"  >> "$GITHUB_ENV"
           echo "CXX=clang-14" >> "$GITHUB_ENV"
+
       - name: Clone SsagePass
         id: clone
         run: |
           set -euxo pipefail
           mkdir -p third_party && cd third_party
-          git clone --depth=1 "${SSAGEPASS_REPO}" SsagePass
+          git clone --depth=1 --branch main "${SSAGEPASS_REPO}" SsagePass  # Chỉ clone nhánh main
           cd SsagePass
           if [ -n "${SSAGEPASS_REF}" ]; then
             git fetch origin "${SSAGEPASS_REF}" && git checkout FETCH_HEAD
           fi
           echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
           find . -maxdepth 2 -print
+
       - name: Detect CMakeLists (Obfuscation preferred)
         id: detect
         shell: bash
@@ -61,6 +69,7 @@ jobs:
           echo "Found build dir: $BUILD_DIR"
           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Patch CMakeLists (rm hardcodes, add LLVM_INCLUDE_DIRS, use libc++)
         run: |
           set -euxo pipefail
@@ -105,6 +114,7 @@ jobs:
           fi
           echo "==== After patch ===="
           nl -ba "$D/CMakeLists.txt" | sed -n '1,240p'
+
       - name: Clean build/
         run: rm -rf build
 
@@ -124,6 +134,7 @@ jobs:
             -DCMAKE_CXX_STANDARD=14 \
             -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
             -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -Wl,-rpath,/usr/lib"
+
       - name: Build plugin
         run: cmake --build build -j"$(nproc)"
 
@@ -135,6 +146,7 @@ jobs:
           test -n "$f" || { echo "::error::plugin .so not found"; find build -maxdepth 3 -type f -printf '%p\n'; exit 1; }
           echo "plugin=$f" >> "$GITHUB_OUTPUT"
           ls -l "$f" && file "$f"
+
       # ---- NDK ONLY from here ----
       - name: Setup NDK r25c
         id: setup-ndk
@@ -150,25 +162,4 @@ jobs:
           CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
           "$CXX" --version
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          cat > ndk_test.cpp <<'EOF'
-          #include <cstdio>
-          __attribute((__annotate__(("fla split strenc"))))
-          static void f(){ std::puts("NDK compile OK"); }
-          int main(){ f(); return 0; }
-          EOF
-          "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
-            -fpass-plugin="$PLUGIN" \
-            -c ndk_test.cpp -o ndk_test.o
-          "$CXX" --target=aarch64-linux-android31 ndk_test.o -shared -o libndk_test.so
-          file libndk_test.so || true
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ssagepass-ndk-artifacts
-          path: |
-            ${{ steps.find_plugin.outputs.plugin }}
-            ${{ steps.detect.outputs.build_dir }}/CMakeLists.txt
-            ${{ steps.detect.outputs.build_dir }}/CMakeLists.txt.orig
-            ndk_test.cpp
-            ndk_test.o
-            libndk_test.so
+          cat > ndk
