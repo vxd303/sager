@@ -54,7 +54,7 @@ jobs:
           add-to-path: true
         continue-on-error: true
 
-      - name: Fallback:download NDK r25c from official link
+      - name: Fallback: download NDK r25c from official link
         if: steps.setup-ndk.outcome != 'success'
         run: |
           set -euxo pipefail
