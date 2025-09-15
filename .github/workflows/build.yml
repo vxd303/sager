@@ -160,7 +160,7 @@ jobs:
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN" \
             -mllvm -split_num=7 \
-            -mllvm -onfla \
+            -mllvm -ofla \
             -mllvm -bcf_prob=100 -mllvm -bcf_loop=3 -mllvm -bcf_cond_compl=5 \
             -mllvm -fw_prob=100 -mllvm -fw_times=4 \
             -c "$SRC" -o test_max_tuned.o || true
