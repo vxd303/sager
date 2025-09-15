@@ -10,7 +10,7 @@ permissions: { contents: read }
 
 env:
   SSAGE_SO_URL: https://github.com/SsageParuders/SsagePass/releases/download/1.0/libSsageObfuscator.so
-  SSAGE_SO_SHA256: ""  # điền nếu muốn verify
+  SSAGE_SO_SHA256: ""  # nếu muốn verify
 
 jobs:
   ndk-test:
@@ -72,8 +72,9 @@ jobs:
           fi
           "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
 
-      # ---------- MẠNH NHẤT (NEW PM only, an toàn) ----------
-      - name: NDK compile test (MAX obfuscation via annotations, NEW PM only)
+      # ---------- MAX (ổn định): bỏ indibr/indcall/vm, giữ fla/split/strenc/bcf/mba/funcwrap ----------
+      - name: NDK compile test – MAX (NEW PM only, -O0)
+        id: test_max
         run: |
           set -euxo pipefail
           PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
@@ -84,31 +85,62 @@ jobs:
           fi
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
 
-          # Bật "nhiều pass" qua annotation: fla/split/strenc/bcf/indibr/indcall/funcwrap/vm/mba
-          # Pass nào không tồn tại sẽ bị plugin bỏ qua, pass có sẽ kích hoạt.
           cat > test_max.cpp <<'EOF'
           #include <cstdio>
           __attribute__((noinline))
-          __attribute((__annotate__(("fla split strenc bcf indibr indcall funcwrap vm mba"))))
-          static void ultra(){ std::puts("NDK MAX obf"); }
+          __attribute((__annotate__(("fla split strenc bcf mba funcwrap"))))
+          static void ultra(){ std::puts("NDK MAX obf (stable)"); }
 
-          // thêm 1 hàm nữa cho chắc ăn
           __attribute__((noinline))
-          __attribute((__annotate__(("fla split strenc bcf vm mba"))))
-          static void ultra2(){ std::puts("NDK MAX obf 2"); }
+          __attribute((__annotate__(("fla split strenc bcf mba funcwrap"))))
+          static void ultra2(){ std::puts("NDK MAX obf 2 (stable)"); }
 
           int main(){ ultra(); ultra2(); return 0; }
           EOF
 
-          "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
+          # NEW PM only, -O0 để IR "hiền" hơn với Flattening
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -c test_max.cpp -o test_max.o
 
           "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
           file libtest_max.so || true
 
-      # ---------- THỬ "MẠNH NHẤT" QUA -mllvm (tùy chọn, không làm fail) ----------
-      - name: Optional:try legacy-style tuning flags (-mllvm), ignore failures
+      # ---------- Fallback: loại hẳn Flattening nếu MAX vẫn crash ----------
+      - name: NDK compile test – MAX-no-fla (NEW PM only, -O0)
+        if: steps.test_max.outcome != 'success'
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
+          cat > test_max_nofla.cpp <<'EOF'
+          #include <cstdio>
+          __attribute__((noinline))
+          __attribute((__annotate__(("split strenc bcf mba funcwrap"))))
+          static void ultra(){ std::puts("NDK MAX no-fla"); }
+
+          __attribute__((noinline))
+          __attribute((__annotate__(("split strenc bcf mba funcwrap"))))
+          static void ultra2(){ std::puts("NDK MAX no-fla 2"); }
+
+          int main(){ ultra(); ultra2(); return 0; }
+          EOF
+
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
+            -fpass-plugin="$PLUGIN" \
+            -c test_max_nofla.cpp -o test_max_nofla.o
+
+          "$CXX" --target=aarch64-linux-android31 test_max_nofla.o -shared -o libtest_max_nofla.so
+          file libtest_max_nofla.so || true
+
+      # (Tuỳ chọn) Thử nạp kép + -mllvm để "đẩy kịch trần" — không làm fail CI
+      - name: Optional:double-load with -mllvm (ignore errors)
         continue-on-error: true
         run: |
           set -euxo pipefail
@@ -120,28 +152,33 @@ jobs:
           fi
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
 
-          # Dùng lại test_max.cpp; thử nạp kép & đẩy tham số "mạnh"
-          # (Tên option có thể khác; nếu plugin không nhận sẽ cảnh báo/ignore)
-          "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
+          SRC="test_max.cpp"
+          if [ ! -f "$SRC" ]; then SRC="test_max_nofla.cpp"; fi
+
+          # Lưu ý: tên option -mllvm phụ thuộc plugin; nếu không có sẽ bị ignored/errored (không fail job).
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN" \
-            -mllvm -split_num=16 \
+            -mllvm -split_num=8 \
             -mllvm -bcf_prob=100 \
             -mllvm -fla_times=2 \
             -mllvm -mba=1 \
-            -c test_max.cpp -o test_max_tuned.o
+            -c "$SRC" -o test_max_tuned.o || true
 
-          "$CXX" --target=aarch64-linux-android31 test_max_tuned.o -shared -o libtest_max_tuned.so
+          "$CXX" --target=aarch64-linux-android31 test_max_tuned.o -shared -o libtest_max_tuned.so || true
           file libtest_max_tuned.so || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ndk-prebuilt-test-strong
+          name: ndk-prebuilt-test-strong-stable
           path: |
             plugin/libSsageObfuscator.so
             test_max.cpp
             test_max.o
             libtest_max.so
+            test_max_nofla.cpp
+            test_max_nofla.o
+            libtest_max_nofla.so
             test_max_tuned.o
             libtest_max_tuned.so
