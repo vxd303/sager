@@ -9,14 +9,14 @@ permissions: { contents: read }
 
 env:
   SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
-  SSAGEPASS_REF: ""   # tùy chọn: refs/heads/master hoặc SHA để pin commit
+  SSAGEPASS_REF: ""   # có thể pin refs/heads/master hoặc SHA cụ thể
 
 jobs:
   build-and-ndk-smoke:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout (your repo – contains this workflow)
+      - name: Checkout (this repo)
         uses: actions/checkout@v4
 
       - name: Install LLVM/Clang 14 (host)
@@ -64,16 +64,16 @@ jobs:
           fi
           test -n "$BUILD_DIR" || { echo "::error::No CMakeLists.txt found in cloned repo"; exit 1; }
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-          nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,120p'
+          nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,160p'
 
-      - name: Patch CMakeLists (remove AOSP hardcoded paths)
+      - name: Patch CMakeLists (drop hardcoded AOSP paths; use C++14; default libstdc++)
         shell: bash
         run: |
           set -euo pipefail
           D="${{ steps.detect_dir.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
 
-          # Bỏ hardcode compiler/LLVM env
+          # Gỡ hardcode compiler/LLVM env nếu có
           sed -i -E \
             -e 's|^set\(CMAKE_C_COMPILER .*$|# patched by CI|g' \
             -e 's|^set\(CMAKE_CXX_COMPILER .*$|# patched by CI|g' \
@@ -81,18 +81,35 @@ jobs:
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# patched by CI|g' \
             "$D/CMakeLists.txt" || true
 
-          # Xóa flags/include libc++ để dùng libstdc++ (khớp clang host & NDK r25c)
+          # Bỏ ép libc++ / include path AOSP; dùng libstdc++ mặc định của host
           sed -i -E \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1||g' \
             -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
             -e 's|-stdlib=libc\+\+||g' \
             "$D/CMakeLists.txt" || true
 
+          # Đảm bảo C++14
           grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || \
             printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
 
-          echo "==== Patched $D/CMakeLists.txt ===="
-          nl -ba "$D/CMakeLists.txt" | sed -n '1,160p'
+      - name: Strip legacy PM and force NEWPM-only
+        shell: bash
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect_dir.outputs.build_dir }}"
+          # Gỡ file legacy để tránh phụ thuộc FunctionPass symbols
+          sed -i '/LegacyLowerSwitch\.cpp/d' "$D/CMakeLists.txt" || true
+          # Ép macro NEWPM-only (nếu code có nhánh điều kiện)
+          {
+            echo ''
+            echo '# Force NEW PM only in CI'
+            echo 'if (TARGET SsageObfuscator)'
+            echo '  target_compile_definitions(SsageObfuscator PRIVATE SSAGE_NEWPM_ONLY=1)'
+            echo 'endif()'
+          } >> "$D/CMakeLists.txt"
+
+          echo "==== Final CMakeLists.txt ===="
+          nl -ba "$D/CMakeLists.txt" | sed -n '1,220p'
 
       - name: Configure (host LLVM 14)
         shell: bash
@@ -124,7 +141,7 @@ jobs:
           echo "plugin=$f" >> "$GITHUB_OUTPUT"
           ls -l "$f"
 
-      - name: Smoke test (host clang++-14, no -mllvm first)
+      - name: Smoke test (host clang++-14, NEW PM only)
         shell: bash
         run: |
           set -euxo pipefail
@@ -135,38 +152,36 @@ jobs:
           int main(){ secret(); return 0; }
           EOF
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          # CHỈ NEW PM: KHÔNG -Xclang, KHÔNG -mllvm
           clang++-14 smoke.cpp -O2 -o smoke.app \
-            -fpass-plugin="$PLUGIN" \
-            -Xclang -load -Xclang "$PLUGIN"
+            -fpass-plugin="$PLUGIN"
           ./smoke.app || true
 
-          # --- PIN NDK r25c bằng action, nếu lỗi 404 thì fallback tải tay ---
+      # --- PIN NDK r25c; nếu lỗi 404 thì fallback tải tay ---
       - name: Setup NDK r25c (preferred)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r25c       # dùng nhãn r25c thay cho 25.2.9519653
+          ndk-version: r25c
           add-to-path: true
-        continue-on-error: true   # để có thể fallback nếu 404
+        continue-on-error: true
 
-      - name: Fallback:NDK r25c from official link
-        if: steps.setupndk.outcome != 'success'
+      - name: Fallback:download NDK r25c from official link
+        if: steps.setup-ndk.outcome != 'success'
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$HOME/ndk"
           cd "$HOME/ndk"
-          # Tải từ link chính thức r25c (Linux)
           curl -L -o android-ndk-r25c-linux.zip \
             https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-          # Xác minh SHA1 theo bảng của Google
           echo "53af80a1cce9144025b81c78c8cd556bff42bd0e  android-ndk-r25c-linux.zip" | sha1sum -c -
           unzip -q android-ndk-r25c-linux.zip
           echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
           echo "NDK=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
           echo "$HOME/ndk/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Verify NDK clang version (expect LLVM 14.0.6)
+      - name: Verify NDK clang version (expect LLVM 14.x)
         shell: bash
         run: |
           set -euxo pipefail
@@ -177,7 +192,7 @@ jobs:
           fi
           "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
 
-      - name: NDK compile test (plugin runs on host, target Android)
+      - name: NDK compile test (NEW PM only; no legacy load)
         shell: bash
         run: |
           set -euxo pipefail
@@ -198,12 +213,10 @@ jobs:
 
           "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
             -fpass-plugin="$PLUGIN" \
-            -Xclang -load -Xclang "$PLUGIN" \
             -c test.cpp -o test.o
 
           "$CXX" --target=aarch64-linux-android31 test.o -shared -o libtest.so
           file libtest.so || true
-
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
