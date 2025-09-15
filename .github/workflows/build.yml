@@ -9,7 +9,7 @@ permissions: { contents: read }
 
 env:
   SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
-  SSAGEPASS_REF: ""   # có thể pin refs/heads/master hoặc SHA cụ thể
+  SSAGEPASS_REF: ""   # có thể pin refs/heads/master hoặc SHA nếu muốn
 
 jobs:
   build-and-ndk-smoke:
@@ -92,24 +92,48 @@ jobs:
           grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || \
             printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
 
-      - name: Strip legacy PM and force NEWPM-only
+      - name: Strip legacy PM file & force NEWPM-only macro
         shell: bash
         run: |
           set -euxo pipefail
           D="${{ steps.detect_dir.outputs.build_dir }}"
-          # Gỡ file legacy để tránh phụ thuộc FunctionPass symbols
+          # Gỡ source legacy thường gặp
           sed -i '/LegacyLowerSwitch\.cpp/d' "$D/CMakeLists.txt" || true
-          # Ép macro NEWPM-only (nếu code có nhánh điều kiện)
+          # Thêm macro ép NEW PM (nếu code có nhánh điều kiện)
           {
             echo ''
             echo '# Force NEW PM only in CI'
             echo 'if (TARGET SsageObfuscator)'
-            echo '  target_compile_definitions(SsageObfuscator PRIVATE SSAGE_NEWPM_ONLY=1)'
+            echo '  target_compile_definitions(SsageObfuscator PRIVATE SSAGE_NEWPM_ONLY=1 LLVM_DISABLE_LEGACY=1)'
             echo 'endif()'
           } >> "$D/CMakeLists.txt"
 
-          echo "==== Final CMakeLists.txt ===="
-          nl -ba "$D/CMakeLists.txt" | sed -n '1,220p'
+      - name: Aggressively neutralize Legacy PM registrations in sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect_dir.outputs.build_dir }}"
+          SRC_DIR="$D/src"
+          if [ -d "$SRC_DIR" ]; then
+            mapfile -t FILES < <(grep -RIl \
+              -e 'RegisterPass<' \
+              -e 'INITIALIZE_PASS' \
+              -e 'PassManagerBuilder' \
+              -e 'legacy::' \
+              -e 'ModulePass' \
+              -e 'FunctionPass' \
+              "$SRC_DIR" || true)
+            for f in "${FILES[@]}"; do
+              cp "$f" "$f.ci.bak" || true
+              # comment các dòng legacy phổ biến (không ảnh hưởng NEW PM)
+              sed -i -E 's/^(.*RegisterPass<.*)$/\/\/ [CI] drop legacy: \1/' "$f" || true
+              sed -i -E 's/^(.*INITIALIZE_PASS.*)$/\/\/ [CI] drop legacy: \1/' "$f" || true
+              sed -i -E 's/^(.*PassManagerBuilder.*)$/\/\/ [CI] drop legacy: \1/' "$f" || true
+              sed -i -E 's/^(.*legacy::.*)$/\/\/ [CI] drop legacy: \1/' "$f" || true
+              # tránh thậm chí cả lớp base legacy khi chỉ dùng cho đăng ký
+              sed -i -E 's/^(.*\b(ModulePass|FunctionPass)\b.*)$/\/\/ [CI] drop legacy: \1/' "$f" || true
+            done
+          fi
 
       - name: Configure (host LLVM 14)
         shell: bash
@@ -152,12 +176,12 @@ jobs:
           int main(){ secret(); return 0; }
           EOF
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          # CHỈ NEW PM: KHÔNG -Xclang, KHÔNG -mllvm
+          # CHỈ NEW PM: KHÔNG -Xclang, KHÔNG -mllvm (tránh legacy)
           clang++-14 smoke.cpp -O2 -o smoke.app \
             -fpass-plugin="$PLUGIN"
           ./smoke.app || true
 
-      # --- PIN NDK r25c; nếu lỗi 404 thì fallback tải tay ---
+      # --- PIN NDK r25c; nếu action lỗi 404 thì fallback tải tay ---
       - name: Setup NDK r25c (preferred)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
