@@ -9,10 +9,8 @@ on:
 permissions: { contents: read }
 
 env:
-  # Upstream prebuilt .so from release 1.0:
   SSAGE_SO_URL: https://github.com/SsageParuders/SsagePass/releases/download/1.0/libSsageObfuscator.so
-  # (Optional) đặt SHA256 nếu bạn muốn verify integrity:
-  SSAGE_SO_SHA256: ""  # ví dụ: "abc123..." (để trống = bỏ qua kiểm tra)
+  SSAGE_SO_SHA256: ""  # điền nếu muốn verify
 
 jobs:
   ndk-test:
@@ -26,7 +24,6 @@ jobs:
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y curl unzip p7zip-full
-          # Cài libc++ phòng trường hợp .so của tác giả link bằng libc++
           sudo apt-get install -y libc++-14-dev libc++abi-14-dev || true
 
       - name: Download prebuilt libSsageObfuscator.so (upstream)
@@ -43,7 +40,7 @@ jobs:
           echo "plugin=$(pwd)/plugin/libSsageObfuscator.so" >> "$GITHUB_OUTPUT"
           ls -l plugin
 
-      # --- PIN NDK r25c; nếu action lỗi 404 thì fallback tải tay ---
+      # --- PIN NDK r25c; nếu action lỗi 404, fallback tải tay ---
       - name: Setup NDK r25c (preferred)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
@@ -52,7 +49,7 @@ jobs:
           add-to-path: true
         continue-on-error: true
 
-      - name: Fallback:download NDK r25c from official link
+      - name: Fallback: download NDK r25c from official link
         if: steps.setup-ndk.outcome != 'success'
         run: |
           set -euxo pipefail
@@ -60,14 +57,12 @@ jobs:
           cd "$HOME/ndk"
           curl -L -o android-ndk-r25c-linux.zip \
             https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-          # SHA1 do Google công bố; nếu muốn thì bật check:
-          # echo "53af80a1cce9144025b81c78c8cd556bff42bd0e  android-ndk-r25c-linux.zip" | sha1sum -c -
           unzip -q android-ndk-r25c-linux.zip
           echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
           echo "NDK=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
           echo "$HOME/ndk/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Verify NDK clang
+      - name: Verify NDK clang (expect LLVM 14.x)
         run: |
           set -euxo pipefail
           if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
@@ -77,11 +72,11 @@ jobs:
           fi
           "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
 
-      - name: NDK compile test (NEW PM only; no legacy)
+      # ---------- MẠNH NHẤT (NEW PM only, an toàn) ----------
+      - name: NDK compile test (MAX obfuscation via annotations, NEW PM only)
         run: |
           set -euxo pipefail
           PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
-
           if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
             NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           else
@@ -89,24 +84,31 @@ jobs:
           fi
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
 
-          # tiny sample with annotations to trigger passes (per README)
-          cat > test.cpp <<'EOF'
+          # Bật "nhiều pass" qua annotation: fla/split/strenc/bcf/indibr/indcall/funcwrap/vm/mba
+          # Pass nào không tồn tại sẽ bị plugin bỏ qua, pass có sẽ kích hoạt.
+          cat > test_max.cpp <<'EOF'
           #include <cstdio>
-          __attribute((__annotate__(("fla split strenc"))))
-          static void f(){ std::puts("NDK compile OK"); }
-          int main(){ f(); return 0; }
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla split strenc bcf indibr indcall funcwrap vm mba"))))
+          static void ultra(){ std::puts("NDK MAX obf"); }
+
+          // thêm 1 hàm nữa cho chắc ăn
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla split strenc bcf vm mba"))))
+          static void ultra2(){ std::puts("NDK MAX obf 2"); }
+
+          int main(){ ultra(); ultra2(); return 0; }
           EOF
 
-          # NEW PM only: KHÔNG -Xclang, KHÔNG -mllvm để tránh dính Legacy PM
           "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
             -fpass-plugin="$PLUGIN" \
-            -c test.cpp -o test.o
+            -c test_max.cpp -o test_max.o
 
-          "$CXX" --target=aarch64-linux-android31 test.o -shared -o libtest.so
-          file libtest.so || true
+          "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
+          file libtest_max.so || true
 
-      # Tuỳ chọn: thử "nạp kép" để truyền -mllvm (KHÔNG làm fail CI)
-      - name: Optional legacy double-load (may fail; ignore)
+      # ---------- THỬ "MẠNH NHẤT" QUA -mllvm (tùy chọn, không làm fail) ----------
+      - name: Optional: try legacy-style tuning flags (-mllvm), ignore failures
         continue-on-error: true
         run: |
           set -euxo pipefail
@@ -118,19 +120,28 @@ jobs:
           fi
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
 
+          # Dùng lại test_max.cpp; thử nạp kép & đẩy tham số "mạnh"
+          # (Tên option có thể khác; nếu plugin không nhận sẽ cảnh báo/ignore)
           "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -Xclang -load -Xclang "$PLUGIN" \
-            -mllvm -split_num=3 \
-            -c test.cpp -o test_legacy.o
+            -mllvm -split_num=16 \
+            -mllvm -bcf_prob=100 \
+            -mllvm -fla_times=2 \
+            -mllvm -mba=1 \
+            -c test_max.cpp -o test_max_tuned.o
+
+          "$CXX" --target=aarch64-linux-android31 test_max_tuned.o -shared -o libtest_max_tuned.so
+          file libtest_max_tuned.so || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ndk-prebuilt-test
+          name: ndk-prebuilt-test-strong
           path: |
             plugin/libSsageObfuscator.so
-            test.cpp
-            test.o
-            libtest.so
-            test_legacy.o
+            test_max.cpp
+            test_max.o
+            libtest_max.so
+            test_max_tuned.o
+            libtest_max_tuned.so
