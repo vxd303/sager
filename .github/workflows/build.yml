@@ -1,84 +1,61 @@
 name: build-ssagepass
-
 on:
   push: { branches: [ main, master ] }
   pull_request:
   workflow_dispatch:
-
 permissions: { contents: read }
 
 env:
   SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
-  SSAGEPASS_REF: ""   # có thể pin refs/heads/master hoặc SHA
-  # Toolchains do bạn chỉ định:
-  CUSTOM_CLANG_URL: https://github.com/fuqiuluo/amice/releases/download/android-ndk-r25c/linux-x86-refs_heads_main-clang-r522817.tar.gz
-  CUSTOM_NDK_URL:   https://github.com/fuqiuluo/amice/releases/download/android-ndk-r25c/android-ndk-r25c.7z
+  SSAGEPASS_REF: ""   # có thể pin SHA/nhánh nếu muốn
+  # AOSP prebuilts repo/commit chứa clang-r450784d1 (LLVM 14.0.7)
+  AOSP_CLANG_REPO: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+  AOSP_CLANG_COMMIT: 4d52068718fb7940b103cc49506f77e5d22f25df  # commit có thư mục clang-r450784d1
 
 jobs:
   build-and-ndk-smoke:
     runs-on: ubuntu-22.04
-
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
 
-      - name: Install base deps
-        shell: bash
+      - name: Install base tools
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build git curl xz-utils p7zip-full \
-            patchelf
-          # Thư mục làm việc cho toolchains tùy chỉnh
-          mkdir -p "$HOME/toolchains" "$HOME/ndk"
+          sudo apt-get install -y git cmake ninja-build curl xz-utils p7zip-full
 
-      # -------------------- DOWLOAD & PREPARE CUSTOM CLANG --------------------
-      - name: Download custom Clang toolchain (tar.gz)
-        id: fetch-clang
-        shell: bash
+      # ---- Lấy đúng Clang 14 AOSP: clang-r450784d1 (LLVM 14.0.7) ----
+      - name: Fetch AOSP clang prebuilts (sparse checkout clang-r450784d1)
+        id: aosp-clang
         run: |
           set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
           cd "$HOME/toolchains"
-          curl -L "$CUSTOM_CLANG_URL" -o clang-custom.tar.gz
-          tar -xzf clang-custom.tar.gz
-          # Tìm thư mục root vừa giải nén (chứa bin/clang++)
-          ROOT=$(find . -maxdepth 2 -type f -name clang++ -printf '%h\n' | head -n1)
-          test -n "$ROOT"
-          CLANG_HOME=$(realpath "$ROOT/..")
-          # Nếu cấu trúc khác, fallback lấy prefix 2 cấp trên
-          if [ ! -d "$CLANG_HOME/bin" ]; then
-            CLANG_HOME=$(realpath "$ROOT")
-          fi
-          echo "clang_home=$CLANG_HOME" >> "$GITHUB_OUTPUT"
-          echo "CLANG_HOME=$CLANG_HOME" >> "$GITHUB_ENV"
-          echo "$CLANG_HOME/bin" >> "$GITHUB_PATH"
-          "$CLANG_HOME/bin/clang++" --version
+          git clone --filter=tree:0 "${AOSP_CLANG_REPO}" prebuilts
+          cd prebuilts
+          git checkout "${AOSP_CLANG_COMMIT}"
+          git sparse-checkout init --cone
+          git sparse-checkout set clang-r450784d1
+          echo "CLANG_HOME=$PWD/clang-r450784d1" >> "$GITHUB_ENV"
+          echo "$PWD/clang-r450784d1/bin" >> "$GITHUB_PATH"
+          "$PWD/clang-r450784d1/bin/clang++" --version
 
-      - name: Locate LLVM cmake dir from custom Clang
-        id: find-llvm-cmake
-        shell: bash
+      - name: Locate LLVM CMake package inside AOSP clang
         run: |
           set -euxo pipefail
-          CLANG_HOME="${CLANG_HOME:-$HOME/toolchains/clang}"
-          # Tìm thư mục chứa cmake/llvm
-          LLVM_DIR=$(find "$CLANG_HOME" -type d -path "*/cmake/llvm" | head -n1 || true)
-          if [ -z "$LLVM_DIR" ]; then
-            # một số gói dùng lib64/cmake/llvm
-            LLVM_DIR=$(find "$CLANG_HOME" -type d -path "*/lib*/cmake/llvm" | head -n1 || true)
-          end_if=false
-          fi
-          test -n "$LLVM_DIR"
+          CH="${CLANG_HOME}"
+          LLVM_DIR=$(find "$CH" -type d -path "*/cmake/llvm" -o -path "*/lib*/cmake/llvm" | head -n1 || true)
+          test -n "$LLVM_DIR" || { echo "::error::Cannot find LLVM CMake dir inside $CH"; exit 1; }
           echo "LLVM_DIR=$LLVM_DIR" >> "$GITHUB_ENV"
-          echo "llvm_dir=$LLVM_DIR" >> "$GITHUB_OUTPUT"
-          # Thiết lập compiler dùng clang tùy chỉnh
-          echo "CC=$CLANG_HOME/bin/clang"     >> "$GITHUB_ENV"
-          echo "CXX=$CLANG_HOME/bin/clang++"  >> "$GITHUB_ENV"
 
-      # -------------------- CLONE & PREPARE SSAGEPASS --------------------
+          # Dùng chính clang-14 AOSP làm compiler
+          echo "CC=$CH/bin/clang"     >> "$GITHUB_ENV"
+          echo "CXX=$CH/bin/clang++"  >> "$GITHUB_ENV"
+
+      # ---- Clone & chuẩn bị SsagePass ----
       - name: Clone upstream SsagePass
         id: clone
-        shell: bash
         run: |
           set -euxo pipefail
           mkdir -p third_party
@@ -91,34 +68,28 @@ jobs:
           echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
           find . -maxdepth 2 -print
 
-      - name: Detect CMakeLists (prefer target SsageObfuscator)
+      - name: Detect CMakeLists (ưu tiên target SsageObfuscator)
         id: detect_dir
-        shell: bash
         run: |
           set -euo pipefail
           SRC="${{ steps.clone.outputs.src_dir }}"
           mapfile -t CANDS < <(find "$SRC" -type f -name 'CMakeLists.txt' -printf '%h\n' | sort -u)
           BUILD_DIR=""
           for d in "${CANDS[@]}"; do
-            if grep -Eiq 'add_library\s*\(\s*SsageObfuscator' "$d/CMakeLists.txt"; then
-              BUILD_DIR="$d"; break
-            fi
+            if grep -Eiq 'add_library\s*\(\s*SsageObfuscator' "$d/CMakeLists.txt"; then BUILD_DIR="$d"; break; fi
           done
-          if [ -z "$BUILD_DIR" ] && [ ${#CANDS[@]} -gt 0 ]; then
-            BUILD_DIR="${CANDS[0]}"
-          fi
-          test -n "$BUILD_DIR" || { echo "::error::No CMakeLists.txt found in cloned repo"; exit 1; }
+          if [ -z "$BUILD_DIR" ] && [ ${#CANDS[@]} -gt 0 ]; then BUILD_DIR="${CANDS[0]}"; fi
+          test -n "$BUILD_DIR" || { echo "::error::No CMakeLists.txt found"; exit 1; }
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,160p'
 
-      - name: Patch CMakeLists (drop hardcoded AOSP paths; use C++14; default libstdc++)
-        shell: bash
+      - name: Patch CMakeLists (bỏ hardcode AOSP cũ, C++14, không ép libc++)
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           D="${{ steps.detect_dir.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
 
-          # Gỡ hardcode compiler/LLVM env nếu có
+          # Bỏ set() compiler/ENV LLVM hardcode
           sed -i -E \
             -e 's|^set\(CMAKE_C_COMPILER .*$|# patched by CI|g' \
             -e 's|^set\(CMAKE_CXX_COMPILER .*$|# patched by CI|g' \
@@ -126,19 +97,16 @@ jobs:
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# patched by CI|g' \
             "$D/CMakeLists.txt" || true
 
-          # Bỏ ép libc++ / include AOSP; dùng libstdc++ mặc định
+          # Bỏ ép -stdlib=libc++ & include path NDK-llvm cũ
           sed -i -E \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1||g' \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|'"$CLANG_HOME"'/include|g' \
             -e 's|-stdlib=libc\+\+||g' \
+            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1||g' \
+            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|'${CLANG_HOME}'/include|g' \
             "$D/CMakeLists.txt" || true
 
-          # Đảm bảo C++14
-          grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || \
-            printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
+          grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
 
-      - name: Strip legacy PM & force NEWPM-only
-        shell: bash
+      - name: Strip Legacy PM & ép NEW PM only
         run: |
           set -euxo pipefail
           D="${{ steps.detect_dir.outputs.build_dir }}"
@@ -151,21 +119,13 @@ jobs:
             echo 'endif()'
           } >> "$D/CMakeLists.txt"
 
-      - name: Aggressively neutralize Legacy PM registrations in sources
-        shell: bash
+      - name: (Tùy trường hợp) Comment mọi đăng ký Legacy trong src/
         run: |
           set -euxo pipefail
           D="${{ steps.detect_dir.outputs.build_dir }}"
-          SRC_DIR="$D/src"
-          if [ -d "$SRC_DIR" ]; then
-            mapfile -t FILES < <(grep -RIl \
-              -e 'RegisterPass<' \
-              -e 'INITIALIZE_PASS' \
-              -e 'PassManagerBuilder' \
-              -e 'legacy::' \
-              -e 'ModulePass' \
-              -e 'FunctionPass' \
-              "$SRC_DIR" || true)
+          SD="$D/src"
+          if [ -d "$SD" ]; then
+            mapfile -t FILES < <(grep -RIl -e 'RegisterPass<' -e 'INITIALIZE_PASS' -e 'PassManagerBuilder' -e 'legacy::' -e 'ModulePass' -e 'FunctionPass' "$SD" || true)
             for f in "${FILES[@]}"; do
               cp "$f" "$f.ci.bak" || true
               sed -i -E 's/^(.*RegisterPass<.*)$/\/\/ [CI] drop legacy: \1/' "$f" || true
@@ -176,9 +136,8 @@ jobs:
             done
           fi
 
-      # -------------------- BUILD WITH CUSTOM CLANG --------------------
-      - name: Configure (custom Clang)
-        shell: bash
+      # ---- Configure & Build bằng đúng Clang 14 AOSP ----
+      - name: Configure (AOSP clang-r450784d1)
         env:
           LLVM_DIR: ${{ env.LLVM_DIR }}
           CC: ${{ env.CC }}
@@ -194,12 +153,10 @@ jobs:
             -DCMAKE_CXX_STANDARD=14
 
       - name: Build
-        shell: bash
         run: cmake --build build -j"$(nproc)"
 
       - name: Locate built plugin
         id: find_plugin
-        shell: bash
         run: |
           set -e
           f=$(find build -type f -name "*SsageObfuscator*.so" -o -name "SsageObfuscator.so" | head -n1 || true)
@@ -207,8 +164,7 @@ jobs:
           echo "plugin=$f" >> "$GITHUB_OUTPUT"
           ls -l "$f"
 
-      - name: Smoke test (host custom clang++, NEW PM only)
-        shell: bash
+      - name: Smoke test (host AOSP clang 14, NEW PM only)
         run: |
           set -euxo pipefail
           cat > smoke.cpp <<'EOF'
@@ -222,29 +178,48 @@ jobs:
             -fpass-plugin="$PLUGIN"
           ./smoke.app || true
 
-      # -------------------- DOWNLOAD PROVIDED NDK (7z) --------------------
-      - name: Download NDK r25c (provided .7z)
-        id: fetch-ndk
-        shell: bash
+      # ---- Pin NDK r25c & test NEW PM only ----
+      - name: Setup NDK r25c (preferred)
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: true
+        continue-on-error: true
+
+      - name: Fallback:download NDK r25c from official link
+        if: steps.setup-ndk.outcome != 'success'
         run: |
           set -euxo pipefail
+          mkdir -p "$HOME/ndk"
           cd "$HOME/ndk"
-          curl -L "$CUSTOM_NDK_URL" -o android-ndk-r25c.7z
-          7z x -y android-ndk-r25c.7z > /dev/null
-          # Detect root folder (thường là android-ndk-r25c)
-          ROOT=$(find . -maxdepth 2 -type d -name "android-ndk-*" | head -n1)
-          test -n "$ROOT"
-          NDK_HOME=$(realpath "$ROOT")
-          echo "NDK=$NDK_HOME" >> "$GITHUB_ENV"
-          echo "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
-          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
+          curl -L -o android-ndk-r25c-linux.zip https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          echo "53af80a1cce9144025b81c78c8cd556bff42bd0e  android-ndk-r25c-linux.zip" | sha1sum -c -
+          unzip -q android-ndk-r25c-linux.zip
+          echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
+          echo "NDK=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
+          echo "$HOME/ndk/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Verify NDK clang version (expect LLVM 14 / r450784d1)
+        run: |
+          set -euxo pipefail
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
 
       - name: NDK compile test (NEW PM only; no legacy)
-        shell: bash
         run: |
           set -euxo pipefail
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
 
           cat > test.cpp <<'EOF'
           #include <cstdio>
