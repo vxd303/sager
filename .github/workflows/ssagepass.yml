@@ -26,14 +26,12 @@ jobs:
           sudo apt-get install -y llvm-14 llvm-14-dev llvm-14-tools clang-14
           sudo apt-get install -y libc++1-14 libc++abi1-14 libc++-14-dev libc++abi-14-dev
           sudo apt-get install -y ninja-build cmake git curl file
-
       - name: Set host toolchain env
         run: |
           set -euxo pipefail
           echo "HOST_LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> "$GITHUB_ENV"
           echo "CC=clang-14"  >> "$GITHUB_ENV"
           echo "CXX=clang-14" >> "$GITHUB_ENV"
-
       - name: Clone SsagePass
         id: clone
         run: |
@@ -46,7 +44,6 @@ jobs:
           fi
           echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
           find . -maxdepth 2 -print
-
       - name: Detect CMakeLists (Obfuscation preferred)
         id: detect
         shell: bash
@@ -64,13 +61,11 @@ jobs:
           echo "Found build dir: $BUILD_DIR"
           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-
       - name: Patch CMakeLists (rm hardcodes, add LLVM_INCLUDE_DIRS, use libc++)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
-
           # Bỏ hardcode compiler/ENV
           sed -i -E \
             -e 's|^set\(CMAKE_C_COMPILER .*$|# [CI] patched|' \
@@ -78,13 +73,10 @@ jobs:
             -e 's|^set\(ENV\{LLVM_HOME\} .*$|# [CI] patched|' \
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# [CI] patched|' \
             "$D/CMakeLists.txt" || true
-
           # Xoá include hardcode tới ndk-llvm (cả c++/v1)
           sed -i -E '/ndk-llvm\/out\/install\/linux-x86\/clang-dev\/include(\/c\+\+\/v1)?/d' "$D/CMakeLists.txt" || true
-
           # Đảm bảo C++14
           grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
-
           # Bổ sung include từ LLVM & libc++
           if ! grep -q 'LLVM_INCLUDE_DIRS' "$D/CMakeLists.txt"; then
             printf '\n# [CI] use LLVM include dirs\ninclude_directories(${LLVM_INCLUDE_DIRS})\n' >> "$D/CMakeLists.txt"
@@ -92,7 +84,6 @@ jobs:
           if ! grep -q '/usr/include/c++/v1' "$D/CMakeLists.txt"; then
             printf '\n# [CI] libc++ headers\ninclude_directories(/usr/include/c++/v1)\n' >> "$D/CMakeLists.txt"
           fi
-
           # Build/link bằng libc++ để khớp NDK
           if ! grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt"; then
             printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
@@ -104,7 +95,6 @@ jobs:
           else
             sed -i 's/CMAKE_SHARED_LINKER_FLAGS[^"]*"/& -stdlib=libc++ -Wl,-rpath,\/usr\/lib/;' "$D/CMakeLists.txt" || true
           fi
-
           # Đảm bảo link tới c++/c++abi nếu cần
           if grep -q 'add_library\s*\(\s*SsageObfuscator' "$D/CMakeLists.txt"; then
             awk '
@@ -113,10 +103,8 @@ jobs:
               inlib && /^\)/ { print "target_link_libraries(SsageObfuscator PRIVATE c++ c++abi)"; inlib=0 }
             ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
           fi
-
           echo "==== After patch ===="
           nl -ba "$D/CMakeLists.txt" | sed -n '1,240p'
-
       - name: Clean build/
         run: rm -rf build
 
@@ -136,7 +124,6 @@ jobs:
             -DCMAKE_CXX_STANDARD=14 \
             -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
             -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -Wl,-rpath,/usr/lib"
-
       - name: Build plugin
         run: cmake --build build -j"$(nproc)"
 
@@ -148,7 +135,6 @@ jobs:
           test -n "$f" || { echo "::error::plugin .so not found"; find build -maxdepth 3 -type f -printf '%p\n'; exit 1; }
           echo "plugin=$f" >> "$GITHUB_OUTPUT"
           ls -l "$f" && file "$f"
-
       # ---- NDK ONLY from here ----
       - name: Setup NDK r25c
         id: setup-ndk
@@ -163,7 +149,6 @@ jobs:
           NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
           "$CXX" --version
-
           PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
           cat > ndk_test.cpp <<'EOF'
           #include <cstdio>
@@ -171,14 +156,11 @@ jobs:
           static void f(){ std::puts("NDK compile OK"); }
           int main(){ f(); return 0; }
           EOF
-
           "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -c ndk_test.cpp -o ndk_test.o
-
           "$CXX" --target=aarch64-linux-android31 ndk_test.o -shared -o libndk_test.so
           file libndk_test.so || true
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
