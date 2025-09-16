@@ -53,131 +53,68 @@ jobs:
         run: |
           set -euxo pipefail
           SRC="${{ steps.clone.outputs.src_dir }}"
-          BUILD_DIR=""
           if [ -f "$SRC/Obfuscation/CMakeLists.txt" ]; then
             BUILD_DIR="$SRC/Obfuscation"
           else
             readarray -t CANDS < <(find "$SRC" -type f -name CMakeLists.txt -printf '%h\n' | sort -u)
-            if [ "${#CANDS[@]}" -gt 0 ]; then BUILD_DIR="${CANDS[0]}"; fi
+            BUILD_DIR="${CANDS[0]:-}"
           fi
           test -n "$BUILD_DIR" || { echo "::error::No CMakeLists found"; exit 1; }
-          echo "Found build dir: $BUILD_DIR"
-          nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-      - name: Patch for LLVM14 (C++17 + startswith + <optional>)
+          nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
+
+      - name: Patch sources for LLVM 14 (C++17, startswith, optional, Demote*, iterator vs begin/end)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
 
-          # 1) Bật C++17 (thay vì 14)
+          # C++17
           if grep -qE 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt"; then
             sed -i -E 's/CMAKE_CXX_STANDARD[[:space:]]+[0-9]+/CMAKE_CXX_STANDARD 17/' "$D/CMakeLists.txt"
           else
             printf '\nset(CMAKE_CXX_STANDARD 17)\n' >> "$D/CMakeLists.txt"
           fi
 
-          # 2) Vá API LLVM: starts_with -> startswith (LLVM 14)
-          #    (chỉ đổi trong thư mục Obfuscation của repo này)
+          # StringRef::starts_with -> startswith
           find "$D" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
             | xargs -0 sed -i 's/\.starts_with(/.startswith(/g'
 
-          # 3) Bổ sung #include <optional> cho file có dùng std::optional/nullopt
+          # include <optional> khi dùng std::optional/nullopt
           mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
           for f in "${OPT_FILES[@]}"; do
             grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
           done
 
-          echo "==== Quick diff around Utils.cpp & Flattening.cpp ===="
-          nl -ba "$D/src/Utils.cpp"       | sed -n '1,240p'   | sed -n '160,210p' || true
-          nl -ba "$D/src/Flattening.cpp"  | sed -n '1,120p'   | sed -n '50,90p'   || true
+          # Utils.cpp: Demote* nhận Instruction*
+          [ -f "$D/src/Utils.cpp" ] && {
+            perl -0777 -pe 's/DemotePHIToStack\s*\(\s*PN\s*,\s*insertPoint\s*\)/DemotePHIToStack(PN, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp" || true
+            perl -0777 -pe 's/DemoteRegToStack\s*\(\s*\*I\s*,\s*false\s*,\s*insertPoint\s*\)/DemoteRegToStack(*I, false, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp" || true
+          }
 
-      - name: Patch for LLVM14 (C++17 + startswith + optional + Demote* + iterator/Instruction*)
-        run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
+          # VMFlatten.cpp: iterator insertionPoint -> Instruction*
+          [ -f "$D/src/VMFlatten.cpp" ] && {
+            perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp" || true
+            perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp" || true
+          }
 
-          # (giữ nguyên các patch bạn đã có ở step trước: C++17, starts_with->startswith, thêm <optional>, Demote* ...)
-          # Nếu bạn đã có step patch đó, có thể chỉ thêm 3 cụm dưới đây.
+          # BogusControlFlow.cpp: lấy iterator thay vì Instruction*
+          [ -f "$D/src/BogusControlFlow.cpp" ] && {
+            perl -0777 -pe 's/\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_][A-Za-z0-9_:\->\s]*)getFirstNonPHIOrDbgOrLifetime\(\)\s*;/\1 = \2getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' -i "$D/src/BogusControlFlow.cpp" || true
+          }
 
-          # A) Mọi chỗ gọi getFirstNonPHIOrDbgOrLifetime() mà dùng như iterator -> thêm ->getIterator()
-          #    (tránh chèn trùng nếu đã có ->getIterator())
-          find "$D/src" -type f -name '*.cpp' -print0 | xargs -0 \
-            sed -i -E 's/getFirstNonPHIOrDbgOrLifetime\(\)([[:space:]]*;)/getFirstNonPHIOrDbgOrLifetime()->getIterator()\1/g'
-
-          # B) Trường hợp phổ biến: so sánh với end()/begin() mà vế trái là Instruction*
-          #    biến bất kỳ X:  X != bb->end()  ->  X->getIterator() != bb->end()
-          #    X == bb->end()                 ->  X->getIterator() == bb->end()
-          #    Tương tự cho begin()
+          # Tổng quát: so sánh với begin()/end() → dùng iterator
           find "$D/src" -type f -name '*.cpp' -print0 | xargs -0 \
             perl -0777 -pe 's/\b([A-Za-z_]\w*)\s*(!=|==)\s*([A-Za-z_][A-Za-z0-9_\.\->]*)\bend\(\)/\1->getIterator() \2 \3end()/g' -i
           find "$D/src" -type f -name '*.cpp' -print0 | xargs -0 \
             perl -0777 -pe 's/\b([A-Za-z_]\w*)\s*(!=|==)\s*([A-Za-z_][A-Za-z0-9_\.\->]*)\bbegin\(\)/\1->getIterator() \2 \3begin()/g' -i
 
-          # C) Riêng VMFlatten: DemotePHIToStack(phi, insertionPoint) -> truyền Instruction*
-          perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp"
-          perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp"
-
-          # D) Đảm bảo file nào dùng std::optional có include <optional>
-          mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
-          for f in "${OPT_FILES[@]}"; do
-            grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
-          done
-
-          echo "=== Quick sanity check ==="
-          grep -RIn --include='*.cpp' 'getFirstNonPHIOrDbgOrLifetime' "$D/src" || true
-          grep -RIn --include='*.cpp' '->getIterator()' "$D/src" | head -n 20 || true
-
-      - name: Patch for LLVM14 (C++17 + startswith + <optional> + Demote* fix)
-        run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
-
-          # 1) Bật C++17
-          if grep -qE 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt"; then
-            sed -i -E 's/CMAKE_CXX_STANDARD[[:space:]]+[0-9]+/CMAKE_CXX_STANDARD 17/' "$D/CMakeLists.txt"
-          else
-            printf '\nset(CMAKE_CXX_STANDARD 17)\n' >> "$D/CMakeLists.txt"
-          fi
-
-          # 2) LLVM14 API: .starts_with( ) -> .startswith( )
-          find "$D" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
-            | xargs -0 sed -i 's/\.starts_with(/.startswith(/g'
-
-          # 3) Thêm <optional> ở file có dùng std::optional/nullopt
-          mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
-          for f in "${OPT_FILES[@]}"; do
-            grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
-          done
-
-          # 4) LLVM14 Demote* nhận Instruction* chứ không phải optional<iterator>
-          #    Chuyển 'insertPoint' (optional<BB::iterator>) -> Instruction*
-          perl -0777 -pe 's/DemotePHIToStack\s*\(\s*PN\s*,\s*insertPoint\s*\)/DemotePHIToStack(PN, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp"
-          perl -0777 -pe 's/DemoteRegToStack\s*\(\s*\*I\s*,\s*false\s*,\s*insertPoint\s*\)/DemoteRegToStack(*I, false, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp"
-          perl -0777 -pe 's/=\s*([A-Za-z_][A-Za-z0-9_:\->\s]*)getFirstNonPHIOrDbgOrLifetime\(\)\s*;/= \1getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' -i "$D/src/BogusControlFlow.cpp"
-
-          echo "Patched Utils.cpp & others for LLVM14 compatibility."
-
-      - name: Patch for LLVM14 (C++17 + startswith + <optional> + Demote* fix incl. VMFlatten)
-        run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
-
-          # (giữ nguyên các lệnh bạn đã có: nâng C++17, starts_with -> startswith, thêm <optional>, fix Utils.cpp ...)
-
-          # --- FIX bổ sung cho VMFlatten: insertionPoint (iterator) -> Instruction*
-          # DemotePHIToStack(phi, insertionPoint) => DemotePHIToStack(phi, &*insertionPoint)
-          perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp"
-
-          # Nếu có dùng DemoteRegToStack(..., false, insertionPoint) trong VMFlatten thì đổi tương tự
-          perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp"
-
-      - name: Patch CMakeLists (sanitize + replace -fno-rtti block)
+      - name: Sanitize CMakeLists (remove hardcodes, add includes, libc++, -fno-rtti, link c++/c++abi)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
 
-          # 1) Bỏ hardcode compiler/ENV/NDK include
+          # Bỏ hardcode compiler/ENV & include NDK cũ
           sed -i -E \
             -e 's|^set\(CMAKE_C_COMPILER .*$|# [CI] patched|' \
             -e 's|^set\(CMAKE_CXX_COMPILER .*$|# [CI] patched|' \
@@ -186,39 +123,45 @@ jobs:
             "$D/CMakeLists.txt" || true
           sed -i -E '/ndk-llvm\/out\/install\/linux-x86\/clang-dev\/include(\/c\+\+\/v1)?/d' "$D/CMakeLists.txt" || true
 
-          # 2) Đảm bảo C++14 + include LLVM/libc++
-          grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
+          # Bổ sung find_package + include LLVM/libc++
+          grep -q 'find_package(LLVM' "$D/CMakeLists.txt" || printf '\nfind_package(LLVM REQUIRED CONFIG)\n' >> "$D/CMakeLists.txt"
           grep -q 'LLVM_INCLUDE_DIRS' "$D/CMakeLists.txt"   || printf '\ninclude_directories(${LLVM_INCLUDE_DIRS})\n' >> "$D/CMakeLists.txt"
           grep -q '/usr/include/c++/v1' "$D/CMakeLists.txt" || printf '\ninclude_directories(/usr/include/c++/v1)\n' >> "$D/CMakeLists.txt"
 
-          # 3) Loại khối set_target_properties(SsageObfuscator PROPERTIES ... ) cũ (nếu có)
+          # Gỡ khối set_target_properties(SsageObfuscator PROPERTIES ...) gây lỗi
           awk '
             BEGIN{drop=0}
-            $0 ~ /^[[:space:]]*set_target_properties[[:space:]]*\([[:space:]]*SsageObfuscator[[:space:]]+PROPERTIES/ {drop=1; print("# [CI] drop bad set_target_properties"); next}
-            drop && $0 ~ /^[[:space:]]*\)[[:space:]]*$/ {drop=0; next}
+            /^[[:space:]]*set_target_properties[[:space:]]*\([[:space:]]*SsageObfuscator[[:space:]]+PROPERTIES/ {drop=1; print("# [CI] drop bad set_target_properties"); next}
+            drop && /^[[:space:]]*\)[[:space:]]*$/ {drop=0; next}
             drop==0 {print}
-          ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci"
-          mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
+          ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
 
-          # 4) Thêm thay thế an toàn: target_compile_options(... -fno-rtti)
-          {
-            echo '# [CI] ensure -fno-rtti via compile options (replaces set_target_properties)'
-            echo 'if (TARGET SsageObfuscator)'
-            echo '  target_compile_options(SsageObfuscator PRIVATE -fno-rtti)'
-            echo 'endif()'
-          } >> "$D/CMakeLists.txt"
+          # Thêm -fno-rtti (không dùng heredoc để khỏi lỗi YAML)
+          printf '%s\n' \
+            '# [CI] ensure -fno-rtti (replace legacy COMPILE_FLAGS on target)' \
+            'if (TARGET SsageObfuscator)' \
+            '  target_compile_options(SsageObfuscator PRIVATE -fno-rtti)' \
+            'endif()' >> "$D/CMakeLists.txt"
 
-          # 5) Dùng libc++ khi build plugin
+          # Link libc++/c++abi
+          if grep -q 'add_library[[:space:]]*\([[:space:]]*SsageObfuscator' "$D/CMakeLists.txt"; then
+            awk '
+              { print }
+              /^add_library[[:space:]]*\([[:space:]]*SsageObfuscator/ { inlib=1 }
+              inlib && /^\)/ { print "target_link_libraries(SsageObfuscator PRIVATE c++ c++abi)"; inlib=0 }
+            ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
+          fi
+
+          # Dùng libc++ khi compile/link
           grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
           grep -q 'CMAKE_SHARED_LINKER_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++ -Wl,-rpath,/usr/lib")\n' >> "$D/CMakeLists.txt"
 
-          echo "==== After patch ===="
-          nl -ba "$D/CMakeLists.txt" | sed -n '1,240p'
+          nl -ba "$D/CMakeLists.txt" | sed -n '1,260p'
 
       - name: Clean build/
         run: rm -rf build
 
-      - name: Configure (host LLVM14; libc++)
+      - name: Configure (host LLVM14; libc++; C++17)
         env:
           LLVM_DIR: ${{ env.HOST_LLVM_DIR }}
           CC: ${{ env.CC }}
@@ -231,7 +174,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER="${CC}" \
             -DCMAKE_CXX_COMPILER="${CXX}" \
-            -DCMAKE_CXX_STANDARD=14 \
+            -DCMAKE_CXX_STANDARD=17 \
             -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
             -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -Wl,-rpath,/usr/lib"
 
