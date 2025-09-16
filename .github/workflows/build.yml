@@ -83,10 +83,10 @@ jobs:
           cat > test_max.cpp <<'EOF'
           #include <cstdio>
           __attribute__((noinline))
-          __attribute((__annotate__(("fla split strenc bcf mba funcwrap vmf"))))
+          __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr"))))
           static void ultra(){ std::puts("NDK MAX obf (stable)"); }
           __attribute__((noinline))
-          __attribute((__annotate__(("fla split strenc bcf mba funcwrap vmf"))))
+          __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr"))))
           static void ultra2(){ std::puts("NDK MAX obf 2 (stable)"); }
           int main(){ ultra(); ultra2(); return 0; }
           EOF
