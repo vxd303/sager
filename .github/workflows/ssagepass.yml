@@ -91,6 +91,42 @@ jobs:
           nl -ba "$D/src/Utils.cpp"       | sed -n '1,240p'   | sed -n '160,210p' || true
           nl -ba "$D/src/Flattening.cpp"  | sed -n '1,120p'   | sed -n '50,90p'   || true
 
+      - name: Patch for LLVM14 (C++17 + startswith + optional + Demote* + iterator/Instruction*)
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+
+          # (giữ nguyên các patch bạn đã có ở step trước: C++17, starts_with->startswith, thêm <optional>, Demote* ...)
+          # Nếu bạn đã có step patch đó, có thể chỉ thêm 3 cụm dưới đây.
+
+          # A) Mọi chỗ gọi getFirstNonPHIOrDbgOrLifetime() mà dùng như iterator -> thêm ->getIterator()
+          #    (tránh chèn trùng nếu đã có ->getIterator())
+          find "$D/src" -type f -name '*.cpp' -print0 | xargs -0 \
+            sed -i -E 's/getFirstNonPHIOrDbgOrLifetime\(\)([[:space:]]*;)/getFirstNonPHIOrDbgOrLifetime()->getIterator()\1/g'
+
+          # B) Trường hợp phổ biến: so sánh với end()/begin() mà vế trái là Instruction*
+          #    biến bất kỳ X:  X != bb->end()  ->  X->getIterator() != bb->end()
+          #    X == bb->end()                 ->  X->getIterator() == bb->end()
+          #    Tương tự cho begin()
+          find "$D/src" -type f -name '*.cpp' -print0 | xargs -0 \
+            perl -0777 -pe 's/\b([A-Za-z_]\w*)\s*(!=|==)\s*([A-Za-z_][A-Za-z0-9_\.\->]*)\bend\(\)/\1->getIterator() \2 \3end()/g' -i
+          find "$D/src" -type f -name '*.cpp' -print0 | xargs -0 \
+            perl -0777 -pe 's/\b([A-Za-z_]\w*)\s*(!=|==)\s*([A-Za-z_][A-Za-z0-9_\.\->]*)\bbegin\(\)/\1->getIterator() \2 \3begin()/g' -i
+
+          # C) Riêng VMFlatten: DemotePHIToStack(phi, insertionPoint) -> truyền Instruction*
+          perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp"
+          perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp"
+
+          # D) Đảm bảo file nào dùng std::optional có include <optional>
+          mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
+          for f in "${OPT_FILES[@]}"; do
+            grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
+          done
+
+          echo "=== Quick sanity check ==="
+          grep -RIn --include='*.cpp' 'getFirstNonPHIOrDbgOrLifetime' "$D/src" || true
+          grep -RIn --include='*.cpp' '->getIterator()' "$D/src" | head -n 20 || true
+
       - name: Patch for LLVM14 (C++17 + startswith + <optional> + Demote* fix)
         run: |
           set -euxo pipefail
