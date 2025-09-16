@@ -248,29 +248,113 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      - name: NDK compile test (load plugin at compile time)
+            # ---------- NDK: MAX (NEW PM only, -O0) ----------
+      - name: NDK compile test – MAX (NEW PM only, -O0)
+        id: test_max
+        continue-on-error: true
         run: |
           set -euxo pipefail
-          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
-          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
-          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          
-          cat > ndk_test.cpp <<'EOF'
+          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
+          cat > test_max.cpp <<'EOF'
           #include <cstdio>
-          __attribute__((annotate("bcf ofla split strenc funwra indibr icall mba vmf")))
-          static void f(){ std::puts("NDK compile OK"); }
-          int main(){ f(); return 0; }
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla enfla split strenc bcf mba funwra funcwrap vmf indibr icall"))))
+          static void ultra(){ std::puts("NDK MAX obf (stable)"); }
+
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla enfla split strenc bcf mba funwra funcwrap vmf indibr icall"))))
+          static void ultra2(){ std::puts("NDK MAX obf 2 (stable)"); }
+
+          int main(){ ultra(); ultra2(); return 0; }
           EOF
 
-          "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -mllvm -mmbcf_prob=100 -mllvm -mmbcf_loop=3 -mllvm -mmbcf_cond_compl=5 \
-            -mllvm -mmsplit_num=4 \
-            -mllvm -mmfw_prob=100 -mllvm -mmfw_times=4 \
-            -mllvm -mmmba-prob=60  -mllvm -mmmba-times=2 \
-            -c ndk_test.cpp -o ndk_test.o
+            -mllvm -mmsplit_num=7 \
+            -mllvm -mmfw_prob=100  -mllvm -mmfw_times=4 -mllvm -mmfw_randstrsource=1 \
+            -mllvm -mmmba-prob=60  -mllvm -mmmba-times=2 -mllvm -mmlinear-mba-terms=10 \
+            -mllvm -mmonlystr=1 \
+            -mllvm -debug-pass-manager \
+            -c test_max.cpp -o test_max.o
 
-           "$CXX" --target=aarch64-linux-android31 ndk_test.o -shared -o libndk_test.so  
+          "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
+          file libtest_max.so || true
+
+      # ---------- Fallback: loại Flattening nếu MAX vẫn crash ----------
+      - name: NDK compile test – MAX-no-fla (NEW PM only, -O0)
+        if: steps.test_max.outcome != 'success'
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
+          cat > test_max_nofla.cpp <<'EOF'
+          #include <cstdio>
+          __attribute__((noinline))
+          __attribute((__annotate__(("split strenc bcf mba funwra funcwrap vmf indibr icall"))))
+          static void ultra(){ std::puts("NDK MAX no-fla"); }
+
+          __attribute__((noinline))
+          __attribute((__annotate__(("split strenc bcf mba funwra funcwrap vmf indibr icall"))))
+          static void ultra2(){ std::puts("NDK MAX no-fla 2"); }
+
+          int main(){ ultra(); ultra2(); return 0; }
+          EOF
+
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
+            -fpass-plugin="$PLUGIN" \
+            -mllvm -mmbcf_prob=100 -mllvm -mmbcf_loop=3 -mllvm -mmbcf_cond_compl=5 \
+            -mllvm -mmsplit_num=7 \
+            -mllvm -mmfw_prob=100  -mllvm -mmfw_times=4 -mllvm -mmfw_randstrsource=1 \
+            -mllvm -mmmba-prob=60  -mllvm -mmmba-times=2 -mllvm -mmlinear-mba-terms=10 \
+            -mllvm -mmonlystr=1 \
+            -mllvm -debug-pass-manager \
+            -c test_max_nofla.cpp -o test_max_nofla.o
+
+          "$CXX" --target=aarch64-linux-android31 test_max_nofla.o -shared -o libtest_max_nofla.so
+          file libtest_max_nofla.so || true
+
+      # ---------- (Tuỳ chọn) Thử "đẩy kịch trần" – chỉ dùng -mllvm, KHÔNG load legacy ----------
+      - name: Optional:extra -mllvm tuning (ignore errors)
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
+          SRC="test_max.cpp"
+          [ -f "$SRC" ] || SRC="test_max_nofla.cpp"
+
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
+            -fpass-plugin="$PLUGIN" \
+            -mllvm -mmbcf_prob=100  -mllvm -mmbcf_loop=5  -mllvm -mmbcf_cond_compl=7 \
+            -mllvm -mmsplit_num=9 \
+            -mllvm -mmfw_prob=100   -mllvm -mmfw_times=6 \
+            -mllvm -mmmba-prob=80   -mllvm -mmmba-times=3 -mllvm -mmlinear-mba-terms=12 \
+            -mllvm -mmonlystr=1 \
+            -c "$SRC" -o test_max_tuned.o || true
+
+          "$CXX" --target=aarch64-linux-android31 test_max_tuned.o -shared -o libtest_max_tuned.so || true
+          file libtest_max_tuned.so || true
+
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
