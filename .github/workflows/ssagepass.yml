@@ -141,8 +141,8 @@ jobs:
           fi
 
 
-          - name: Fix IPObfuscationContext splice (ptr vs ref) for LLVM14
-            run: |
+      - name: Fix IPObfuscationContext splice (ptr vs ref) for LLVM14
+        run: |
               set -euxo pipefail
               D="${{ steps.detect.outputs.build_dir }}"
               F="$D/src/IPObfuscationContext.cpp"
@@ -157,8 +157,7 @@ jobs:
           
               # Trường hợp dòng chính xác (tên biến NF/F) thì đảm bảo đúng mũi tên
               sed -i 's/NF->getBasicBlockList().splice(NF->begin(), F.getBasicBlockList());/NF->getBasicBlockList().splice(NF->getBasicBlockList().begin(), F->getBasicBlockList());/' "$F" || true
-
-          
+       
       - name: Sanitize CMakeLists (no hardcodes, add includes, libc++, -fno-rtti, link c++/c++abi)
         run: |
           set -euxo pipefail
