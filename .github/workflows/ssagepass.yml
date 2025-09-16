@@ -9,12 +9,11 @@ permissions: { contents: read }
 
 env:
   SSAGEPASS_REPO: https://github.com/lux-QAQ/SsagePass.git
-  SSAGEPASS_REF: ""   # pin SHA/nhánh nếu muốn
+  SSAGEPASS_REF: ""
 
 jobs:
   build-and-ndk:
     runs-on: ubuntu-22.04
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -235,11 +234,13 @@ jobs:
       - name: Locate plugin
         id: find_plugin
         run: |
-          set -e
+          set -euxo pipefail
           f=$(find build -type f -name "*SsageObfuscator*.so" -o -name "SsageObfuscator.so" | head -n1 || true)
           test -n "$f" || { echo "::error::plugin .so not found"; find build -maxdepth 3 -type f -printf '%p\n'; exit 1; }
-          echo "plugin=$f" >> "$GITHUB_OUTPUT"
-          ls -l "$f" && file "$f"
+          f_abs="$(realpath "$f")"
+          echo "plugin=$f_abs" >> "$GITHUB_OUTPUT"
+          echo "Resolved plugin path: $f_abs"
+          ls -l "$f_abs" && file "$f_abs"
 
       - name: Setup NDK r25c
         id: setup-ndk
@@ -248,30 +249,30 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-            # ---------- NDK: MAX (NEW PM only, -O0) ----------
+      # ---------- NDK: MAX (NEW PM only, -O0) ----------
       - name: NDK compile test – MAX (NEW PM only, -O0)
         id: test_max
         continue-on-error: true
         run: |
           set -euxo pipefail
-          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          echo "Using plugin: $PLUGIN"; ls -l "$PLUGIN"
           if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
             NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           else
             NDK="${NDK:-$ANDROID_NDK_HOME}"
           fi
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          "$CXX" --version
 
           cat > test_max.cpp <<'EOF'
           #include <cstdio>
           __attribute__((noinline))
           __attribute((__annotate__(("fla enfla split strenc bcf mba funwra funcwrap vmf indibr icall"))))
           static void ultra(){ std::puts("NDK MAX obf (stable)"); }
-
           __attribute__((noinline))
           __attribute((__annotate__(("fla enfla split strenc bcf mba funwra funcwrap vmf indibr icall"))))
           static void ultra2(){ std::puts("NDK MAX obf 2 (stable)"); }
-
           int main(){ ultra(); ultra2(); return 0; }
           EOF
 
@@ -293,7 +294,8 @@ jobs:
         if: steps.test_max.outcome != 'success'
         run: |
           set -euxo pipefail
-          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          echo "Using plugin: $PLUGIN"; ls -l "$PLUGIN"
           if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
             NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           else
@@ -306,11 +308,9 @@ jobs:
           __attribute__((noinline))
           __attribute((__annotate__(("split strenc bcf mba funwra funcwrap vmf indibr icall"))))
           static void ultra(){ std::puts("NDK MAX no-fla"); }
-
           __attribute__((noinline))
           __attribute((__annotate__(("split strenc bcf mba funwra funcwrap vmf indibr icall"))))
           static void ultra2(){ std::puts("NDK MAX no-fla 2"); }
-
           int main(){ ultra(); ultra2(); return 0; }
           EOF
 
@@ -327,21 +327,20 @@ jobs:
           "$CXX" --target=aarch64-linux-android31 test_max_nofla.o -shared -o libtest_max_nofla.so
           file libtest_max_nofla.so || true
 
-      # ---------- (Tuỳ chọn) Thử "đẩy kịch trần" – chỉ dùng -mllvm, KHÔNG load legacy ----------
-      - name: Optional:extra -mllvm tuning (ignore errors)
+      # ---------- Optional tuning ----------
+      - name: Optional:extra-mllvm tuning (ignore errors)
         continue-on-error: true
         run: |
           set -euxo pipefail
-          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          echo "Using plugin: $PLUGIN"; ls -l "$PLUGIN"
           if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
             NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           else
             NDK="${NDK:-$ANDROID_NDK_HOME}"
           fi
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
-
-          SRC="test_max.cpp"
-          [ -f "$SRC" ] || SRC="test_max_nofla.cpp"
+          SRC="test_max.cpp"; [ -f "$SRC" ] || SRC="test_max_nofla.cpp"
 
           "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
@@ -355,15 +354,20 @@ jobs:
           "$CXX" --target=aarch64-linux-android31 test_max_tuned.o -shared -o libtest_max_tuned.so || true
           file libtest_max_tuned.so || true
 
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ssagepass-ndk-artifacts
+          if-no-files-found: ignore
           path: |
             ${{ steps.find_plugin.outputs.plugin }}
             ${{ steps.detect.outputs.build_dir }}/CMakeLists.txt
             ${{ steps.detect.outputs.build_dir }}/CMakeLists.txt.orig
-            ndk_test.cpp
-            ndk_test.o
-            libndk_test.so
+            test_max.cpp
+            test_max.o
+            libtest_max.so
+            test_max_nofla.cpp
+            test_max_nofla.o
+            libtest_max_nofla.so
+            test_max_tuned.o
+            libtest_max_tuned.so
