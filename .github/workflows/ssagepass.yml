@@ -109,64 +109,64 @@ jobs:
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
           cat > "$D/src/PMRegistration.cpp" <<'EOF'
-#include "llvm/IR/PassManager.h"
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/PassPlugin.h"
-#include "Flattening.h"
-#include "FlatteningEnhanced.h"
-#include "SplitBasicBlock.h"
-#include "BogusControlFlow.h"
-#include "MBAObfuscation.h"
-#include "FunctionWrapper.h"
-#include "VMFlatten.h"
-#include "IndirectBranch.h"
-#include "IndirectCall.h"
-#include "StringEncryption.h"
-using namespace llvm;
-extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return { LLVM_PLUGIN_API_VERSION, "SsageObfuscator", "0.1",
-    [](PassBuilder &PB) {
-      PB.registerPipelineStartEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel) {
-          MPM.addPass(FunctionWrapperPass(true));
-          MPM.addPass(IndirectBranchPass(true));
-          MPM.addPass(StringEncryptionPass(true));
-          MPM.addPass(FlatteningEnhanced(true));
-          FunctionPassManager FPM;
-          FPM.addPass(FlatteningPass(true));
-          FPM.addPass(SplitBasicBlockPass(true));
-          FPM.addPass(BogusControlFlowPass(true));
-          FPM.addPass(MBAObfuscation(true));
-          FPM.addPass(IndirectCallPass(true));
-          FPM.addPass(VMFlattenPass(true));
-          MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-        }
-      );
-      PB.registerPipelineParsingCallback(
-        [](StringRef Name, ModulePassManager &MPM,
-          ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "ssage-all") {
-            MPM.addPass(FunctionWrapperPass(true));
-            MPM.addPass(IndirectBranchPass(true));
-            MPM.addPass(StringEncryptionPass(true));
-            MPM.addPass(FlatteningEnhanced(true));
-            FunctionPassManager FPM;
-            FPM.addPass(FlatteningPass(true));
-            FPM.addPass(SplitBasicBlockPass(true));
-            FPM.addPass(BogusControlFlowPass(true));
-            FPM.addPass(MBAObfuscation(true));
-            FPM.addPass(IndirectCallPass(true));
-            FPM.addPass(VMFlattenPass(true));
-            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-            return true;
+          #include "llvm/IR/PassManager.h"
+          #include "llvm/Passes/PassBuilder.h"
+          #include "llvm/Passes/PassPlugin.h"
+          #include "Flattening.h"
+          #include "FlatteningEnhanced.h"
+          #include "SplitBasicBlock.h"
+          #include "BogusControlFlow.h"
+          #include "MBAObfuscation.h"
+          #include "FunctionWrapper.h"
+          #include "VMFlatten.h"
+          #include "IndirectBranch.h"
+          #include "IndirectCall.h"
+          #include "StringEncryption.h"
+          using namespace llvm;
+          extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
+            return { LLVM_PLUGIN_API_VERSION, "SsageObfuscator", "0.1",
+              [](PassBuilder &PB) {
+                PB.registerPipelineStartEPCallback(
+                  [](ModulePassManager &MPM, OptimizationLevel) {
+                    MPM.addPass(FunctionWrapperPass(true));
+                    MPM.addPass(IndirectBranchPass(true));
+                    MPM.addPass(StringEncryptionPass(true));
+                    MPM.addPass(FlatteningEnhanced(true));
+                    FunctionPassManager FPM;
+                    FPM.addPass(FlatteningPass(true));
+                    FPM.addPass(SplitBasicBlockPass(true));
+                    FPM.addPass(BogusControlFlowPass(true));
+                    FPM.addPass(MBAObfuscation(true));
+                    FPM.addPass(IndirectCallPass(true));
+                    FPM.addPass(VMFlattenPass(true));
+                    MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+                  }
+                );
+                PB.registerPipelineParsingCallback(
+                  [](StringRef Name, ModulePassManager &MPM,
+                    ArrayRef<PassBuilder::PipelineElement>) {
+                    if (Name == "ssage-all") {
+                      MPM.addPass(FunctionWrapperPass(true));
+                      MPM.addPass(IndirectBranchPass(true));
+                      MPM.addPass(StringEncryptionPass(true));
+                      MPM.addPass(FlatteningEnhanced(true));
+                      FunctionPassManager FPM;
+                      FPM.addPass(FlatteningPass(true));
+                      FPM.addPass(SplitBasicBlockPass(true));
+                      FPM.addPass(BogusControlFlowPass(true));
+                      FPM.addPass(MBAObfuscation(true));
+                      FPM.addPass(IndirectCallPass(true));
+                      FPM.addPass(VMFlattenPass(true));
+                      MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+                      return true;
+                    }
+                    return false;
+                  }
+                );
+              }
+            };
           }
-          return false;
-        }
-      );
-    }
-  };
-}
-EOF
+          EOF
 
       - name: Sanitize CMakeLists (libc++, -fno-rtti, link c++/c++abi)
         run: |
