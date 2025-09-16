@@ -111,18 +111,21 @@ jobs:
           D="${{ steps.detect.outputs.build_dir }}"
           [ -f "$D/src/IndirectBranch.cpp" ] && sed -i 's/->getIterator()//g' "$D/src/IndirectBranch.cpp" || true
 
-      - name: Fix BogusControlFlow for LLVM14 (Create insert point + iterator comparisons)
+      - name: Fix BogusControlFlow for LLVM14 (Create insert point + iterator use)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
           F="$D/src/BogusControlFlow.cpp"
           if [ -f "$F" ]; then
-            # 1) BinaryOperator::Create(..., InsertBefore->getIterator()) -> InsertBefore
+            # 1) BinaryOperator::Create(..., InsertBefore->getIterator()) -> InsertBefore (Instruction*)
             sed -i 's/InsertBefore->getIterator()/InsertBefore/g' "$F"
 
-            # 2) So sánh với end()/begin(): chuyển Instruction* -> iterator
-            #    ...getFirstNonPHIOrDbgOrLifetime() ==/!= ...  ==>  ...->getIterator() ==/!= ...
+            # 2) So sánh với begin()/end(): chuyển Instruction* -> iterator
             perl -0777 -pe 's/getFirstNonPHIOrDbgOrLifetime\(\)\s*(==|!=)/getFirstNonPHIOrDbgOrLifetime()->getIterator() $1/g' -i "$F"
+
+            # 3) Gán/khởi tạo iterator bằng Instruction*: thêm ->getIterator()
+            #    (chỉ áp dụng khi kết thúc bằng dấu chấm phẩy để tránh tham số hàm)
+            sed -i 's/\<getFirstNonPHIOrDbgOrLifetime()\s*;/getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' "$F"
           fi
 
       - name: Sanitize CMakeLists (no hardcodes, add includes, libc++, -fno-rtti, link c++/c++abi)
@@ -153,7 +156,7 @@ jobs:
             drop==0 {print}
           ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
 
-          # ensure -fno-rtti (tránh heredoc YAML)
+          # ensure -fno-rtti
           {
             echo '# [CI] ensure -fno-rtti'
             echo 'if (TARGET SsageObfuscator)'
