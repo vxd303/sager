@@ -9,7 +9,7 @@ permissions: { contents: read }
 
 env:
   SSAGEPASS_REPO: https://github.com/lux-QAQ/SsagePass.git
-  SSAGEPASS_REF: ""   # có thể pin SHA/nhánh nếu muốn
+  SSAGEPASS_REF: ""
 
 jobs:
   build-and-ndk:
@@ -67,30 +67,25 @@ jobs:
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
-
-          # Bật C++17 trong CMake
+          # C++17
           if grep -qE 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt"; then
             sed -i -E 's/CMAKE_CXX_STANDARD[[:space:]]+[0-9]+/CMAKE_CXX_STANDARD 17/' "$D/CMakeLists.txt"
           else
             printf '\nset(CMAKE_CXX_STANDARD 17)\n' >> "$D/CMakeLists.txt"
           fi
-
           # StringRef::starts_with -> startswith
           find "$D" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
             | xargs -0 sed -i 's/\.starts_with(/.startswith(/g'
-
-          # include <optional> khi có std::optional/nullopt
+          # include <optional> nếu dùng std::optional/nullopt
           mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
           for f in "${OPT_FILES[@]}"; do
             grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
           done
-
-          # Utils.cpp: Demote* nhận Instruction* (không phải optional<iterator>)
+          # Utils.cpp: Demote* nhận Instruction*
           if [ -f "$D/src/Utils.cpp" ]; then
             perl -0777 -pe 's/DemotePHIToStack\s*\(\s*PN\s*,\s*insertPoint\s*\)/DemotePHIToStack(PN, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp" || true
             perl -0777 -pe 's/DemoteRegToStack\s*\(\s*\*I\s*,\s*false\s*,\s*insertPoint\s*\)/DemoteRegToStack(*I, false, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp" || true
           fi
-
           # VMFlatten.cpp: iterator -> Instruction*
           if [ -f "$D/src/VMFlatten.cpp" ]; then
             perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp" || true
@@ -103,17 +98,10 @@ jobs:
           D="${{ steps.detect.outputs.build_dir }}"
           F1="$D/src/LegacyLowerSwitch.cpp"
           F2="$D/src/BogusControlFlow.cpp"
-
-          # LegacyLowerSwitch: getFirstNonPHI() -> ->getIterator() khi gán vào BasicBlock::iterator
           [ -f "$F1" ] && sed -i 's/getFirstNonPHI()/getFirstNonPHI()->getIterator()/g' "$F1" || true
-
-          # BogusControlFlow:
           if [ -f "$F2" ]; then
-            # insert point BinaryOperator::Create(..., InsertBefore->getIterator()) -> InsertBefore
             sed -i 's/InsertBefore->getIterator()/InsertBefore/g' "$F2"
-            # so sánh begin()/end(): đổi Instruction* sang iterator
             perl -0777 -pe 's/getFirstNonPHIOrDbgOrLifetime\(\)\s*(==|!=)/getFirstNonPHIOrDbgOrLifetime()->getIterator() $1/g' -i "$F2"
-            # gán iterator bằng Instruction*; thêm ->getIterator();
             sed -i 's/\<getFirstNonPHIOrDbgOrLifetime()\s*;/getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' "$F2"
           fi
 
@@ -123,12 +111,10 @@ jobs:
           D="${{ steps.detect.outputs.build_dir }}"
           F="$D/src/IPObfuscationContext.cpp"
           test -f "$F" || exit 0
-          # đổi NF->splice(NF->begin(), F);  thành  NF->getBasicBlockList().splice(NF->getBasicBlockList().begin(), F->getBasicBlockList());
           sed -i -E 's/([A-Za-z_]\w*)->splice\(\s*\1->begin\(\)\s*,\s*([A-Za-z_]\w*)\s*\);/\1->getBasicBlockList().splice(\1->getBasicBlockList().begin(), \2->getBasicBlockList());/g' "$F"
-          # sửa chấm thành mũi tên nếu có
           sed -i -E 's/([A-Za-z_]\w*)\.getBasicBlockList\(\)/\1->getBasicBlockList()/g' "$F"
 
-      - name: Overwrite PMRegistration.cpp (proper pass wiring for LLVM14)
+      - name: Overwrite PMRegistration.cpp (fix ctor args, correct wiring)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
@@ -163,14 +149,14 @@ jobs:
                     MPM.addPass(FunctionWrapperPass(true));
                     MPM.addPass(IndirectBranchPass(true));
                     MPM.addPass(StringEncryptionPass(true));
-                    MPM.addPass(FlatteningEnhanced());
+                    MPM.addPass(FlatteningEnhanced(true));   // <-- cần bool
 
                     // Function passes:
                     FunctionPassManager FPM;
                     FPM.addPass(FlatteningPass(true));
                     FPM.addPass(SplitBasicBlockPass(true));
                     FPM.addPass(BogusControlFlowPass(true));
-                    FPM.addPass(MBAObfuscation());      // no ctor args
+                    FPM.addPass(MBAObfuscation(true));       // <-- cần bool
                     FPM.addPass(IndirectCallPass(true));
                     FPM.addPass(VMFlattenPass(true));
 
@@ -185,13 +171,13 @@ jobs:
                       MPM.addPass(FunctionWrapperPass(true));
                       MPM.addPass(IndirectBranchPass(true));
                       MPM.addPass(StringEncryptionPass(true));
-                      MPM.addPass(FlatteningEnhanced());
+                      MPM.addPass(FlatteningEnhanced(true)); // <-- cần bool
 
                       FunctionPassManager FPM;
                       FPM.addPass(FlatteningPass(true));
                       FPM.addPass(SplitBasicBlockPass(true));
                       FPM.addPass(BogusControlFlowPass(true));
-                      FPM.addPass(MBAObfuscation());
+                      FPM.addPass(MBAObfuscation(true));     // <-- cần bool
                       FPM.addPass(IndirectCallPass(true));
                       FPM.addPass(VMFlattenPass(true));
                       MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
@@ -210,8 +196,6 @@ jobs:
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
-
-          # Bỏ hardcode compiler/ENV & include NDK cũ
           sed -i -E \
             -e 's|^set\(CMAKE_C_COMPILER .*$|# [CI] patched|' \
             -e 's|^set\(CMAKE_CXX_COMPILER .*$|# [CI] patched|' \
@@ -219,29 +203,21 @@ jobs:
             -e 's|^set\(ENV\{LLVM_DIR\} .*$|# [CI] patched|' \
             "$D/CMakeLists.txt" || true
           sed -i -E '/ndk-llvm\/out\/install\/linux-x86\/clang-dev\/include(\/c\+\+\/v1)?/d' "$D/CMakeLists.txt" || true
-
-          # Bảo đảm find_package(LLVM) + include dirs
           grep -q 'find_package(LLVM' "$D/CMakeLists.txt" || printf '\nfind_package(LLVM REQUIRED CONFIG)\n' >> "$D/CMakeLists.txt"
           grep -q 'LLVM_INCLUDE_DIRS' "$D/CMakeLists.txt" || printf '\ninclude_directories(${LLVM_INCLUDE_DIRS})\n' >> "$D/CMakeLists.txt"
           grep -q '/usr/include/c++/v1' "$D/CMakeLists.txt" || printf '\ninclude_directories(/usr/include/c++/v1)\n' >> "$D/CMakeLists.txt"
-
-          # Loại mọi khối set_target_properties(SsageObfuscator PROPERTIES ...) cũ (nếu có)
           awk '
             BEGIN{drop=0}
             /^[[:space:]]*set_target_properties[[:space:]]*\([[:space:]]*SsageObfuscator[[:space:]]+PROPERTIES/ {drop=1; print("# [CI] drop bad set_target_properties"); next}
             drop && /^[[:space:]]*\)[[:space:]]*$/ {drop=0; next}
             drop==0 {print}
           ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
-
-          # ensure -fno-rtti
           {
             echo '# [CI] ensure -fno-rtti'
             echo 'if (TARGET SsageObfuscator)'
             echo '  target_compile_options(SsageObfuscator PRIVATE -fno-rtti)'
             echo 'endif()'
           } >> "$D/CMakeLists.txt"
-
-          # Link libc++/c++abi ngay sau add_library(SsageObfuscator ...)
           if grep -q 'add_library[[:space:]]*\([[:space:]]*SsageObfuscator' "$D/CMakeLists.txt"; then
             awk '
               { print }
@@ -249,11 +225,8 @@ jobs:
               inlib && /^\)/ { print "target_link_libraries(SsageObfuscator PRIVATE c++ c++abi)"; inlib=0 }
             ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
           fi
-
-          # Dùng libc++ cho compile/link
           grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
           grep -q 'CMAKE_SHARED_LINKER_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++ -Wl,-rpath,/usr/lib")\n' >> "$D/CMakeLists.txt"
-
           nl -ba "$D/CMakeLists.txt" | sed -n '1,260p'
 
       - name: Clean build/
@@ -325,7 +298,7 @@ jobs:
           "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
           file libtest_max.so || true
 
-          # (tuỳ chọn) xuất IR sau pass để kiểm tra biến đổi
+          # xuất IR sau pass để check biến đổi
           "$CXX" --target=aarch64-linux-android31 -O0 -S -emit-llvm \
             -fpass-plugin="$PLUGIN" \
             test_max.cpp -o test_max.ll
