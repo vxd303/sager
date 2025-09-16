@@ -9,7 +9,7 @@ permissions: { contents: read }
 
 env:
   SSAGEPASS_REPO: https://github.com/lux-QAQ/SsagePass.git
-  SSAGEPASS_REF: ""   # có thể pin SHA/nhánh nếu muốn
+  SSAGEPASS_REF: ""
 
 jobs:
   build-and-ndk:
@@ -19,7 +19,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install host LLVM14 + deps
+      - name: Install LLVM14 + deps
         run: |
           set -euxo pipefail
           sudo apt-get update
@@ -29,7 +29,6 @@ jobs:
 
       - name: Set host toolchain env
         run: |
-          set -euxo pipefail
           echo "HOST_LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> "$GITHUB_ENV"
           echo "CC=clang-14"  >> "$GITHUB_ENV"
           echo "CXX=clang-14" >> "$GITHUB_ENV"
@@ -45,11 +44,9 @@ jobs:
             git fetch origin "${SSAGEPASS_REF}" && git checkout FETCH_HEAD
           fi
           echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
-          find . -maxdepth 2 -print
 
       - name: Detect CMakeLists (Obfuscation preferred)
         id: detect
-        shell: bash
         run: |
           set -euxo pipefail
           SRC="${{ steps.clone.outputs.src_dir }}"
@@ -61,9 +58,8 @@ jobs:
           fi
           test -n "$BUILD_DIR" || { echo "::error::No CMakeLists found"; exit 1; }
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-          nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
 
-      - name: Patch sources for LLVM14 (C++17, startswith, <optional>, Demote*)
+      - name: Patch sources for LLVM14
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
@@ -75,52 +71,38 @@ jobs:
             printf '\nset(CMAKE_CXX_STANDARD 17)\n' >> "$D/CMakeLists.txt"
           fi
 
-          # StringRef::starts_with -> startswith (LLVM 14)
-          find "$D" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
-            | xargs -0 sed -i 's/\.starts_with(/.startswith(/g'
+          # StringRef::starts_with -> startswith
+          find "$D" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 | xargs -0 sed -i 's/\.starts_with(/.startswith(/g'
 
-          # include <optional> khi dùng std::optional/nullopt
-          mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
-          for f in "${OPT_FILES[@]}"; do
+          # <optional>
+          mapfile -t OPT < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
+          for f in "${OPT[@]}"; do
             grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
           done
 
-          # Utils.cpp: Demote* nhận Instruction*
-          if [ -f "$D/src/Utils.cpp" ]; then
+          # Demote* args => Instruction*
+          [ -f "$D/src/Utils.cpp" ] && {
             perl -0777 -pe 's/DemotePHIToStack\s*\(\s*PN\s*,\s*insertPoint\s*\)/DemotePHIToStack(PN, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp" || true
             perl -0777 -pe 's/DemoteRegToStack\s*\(\s*\*I\s*,\s*false\s*,\s*insertPoint\s*\)/DemoteRegToStack(*I, false, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp" || true
-          fi
+          }
 
-          # VMFlatten.cpp: iterator -> Instruction*
-          if [ -f "$D/src/VMFlatten.cpp" ]; then
+          # VMFlatten iterator -> Instruction*
+          [ -f "$D/src/VMFlatten.cpp" ] && {
             perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp" || true
             perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp" || true
-          fi
+          }
 
-      - name: Fix IPObfuscationContext for LLVM14 (splice basic blocks)
-        run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
+          # IPObfuscationContext splice
           F="$D/src/IPObfuscationContext.cpp"
           if [ -f "$F" ]; then
-            # Thay NF->splice(NF->begin(), F); thành splice list-of-BB
             sed -i 's/NF->splice(NF->begin(), F);/NF->getBasicBlockList().splice(NF->getBasicBlockList().begin(), F->getBasicBlockList());/' "$F" || true
-            # Chuẩn hoá mọi biến tương tự
             perl -0777 -pe 's/([A-Za-z_]\w*)->splice\(\s*\1->begin\(\)\s*,\s*([A-Za-z_]\w*)\s*\);/\1->getBasicBlockList().splice(\1->getBasicBlockList().begin(), \2->getBasicBlockList());/g' -i "$F" || true
           fi
 
-      - name: Fix LegacyLowerSwitch for LLVM14 (iterator vs Instruction*)
-        run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
-          if [ -f "$D/src/LegacyLowerSwitch.cpp" ]; then
-            sed -i 's/getFirstNonPHI()/getFirstNonPHI()->getIterator()/g' "$D/src/LegacyLowerSwitch.cpp" || true
-          fi
+          # LegacyLowerSwitch iterator
+          [ -f "$D/src/LegacyLowerSwitch.cpp" ] && sed -i 's/getFirstNonPHI()/getFirstNonPHI()->getIterator()/g' "$D/src/LegacyLowerSwitch.cpp" || true
 
-      - name: Fix BogusControlFlow for LLVM14 (Create insert point + iterator use)
-        run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
+          # BogusControlFlow insert point & iterator compares
           F="$D/src/BogusControlFlow.cpp"
           if [ -f "$F" ]; then
             sed -i 's/InsertBefore->getIterator()/InsertBefore/g' "$F" || true
@@ -128,85 +110,109 @@ jobs:
             sed -i 's/\<getFirstNonPHIOrDbgOrLifetime()\s*;/getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' "$F" || true
           fi
 
-      - name: Patch PMRegistration (ctor flags for passes)
+      # >>> Ghi đè PMRegistration: hook ở PipelineStart + in debug <<<
+      - name: Replace PMRegistration (always-on at pipeline start)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
-          F="$D/src/PMRegistration.cpp"
-          test -f "$F" || exit 0
-          # Thêm (true) cho các pass yêu cầu bool flag
-          sed -i -E 's/\bFlatteningEnhanced\(\)/FlatteningEnhanced(true)/g' "$F" || true
-          sed -i -E 's/\bFlatteningPass\(\)/FlatteningPass(true)/g' "$F" || true
-          sed -i -E 's/\bSplitBasicBlockPass\(\)/SplitBasicBlockPass(true)/g' "$F" || true
-          sed -i -E 's/\bBogusControlFlowPass\(\)/BogusControlFlowPass(true)/g' "$F" || true
-          sed -i -E 's/\bMBAObfuscation\(\)/MBAObfuscation(true)/g' "$F" || true
-          sed -i -E 's/\bFunctionWrapperPass\(\)/FunctionWrapperPass(true)/g' "$F" || true
-          sed -i -E 's/\bVMFlattenPass\(\)/VMFlattenPass(true)/g' "$F" || true
-          sed -i -E 's/\bIndirectBranchPass\(\)/IndirectBranchPass(true)/g' "$F" || true
-          sed -i -E 's/\bIndirectCallPass\(\)/IndirectCallPass(true)/g' "$F" || true
-          sed -i -E 's/\bStringEncryptionPass\(\)/StringEncryptionPass(true)/g' "$F" || true
+          cat > "$D/src/PMRegistration.cpp" <<'CPP'
+          #include "llvm/Passes/PassBuilder.h"
+          #include "llvm/Passes/PassPlugin.h"
+          #include "llvm/Passes/OptimizationLevel.h"
+          #include "llvm/IR/PassManager.h"
+          #include "llvm/Support/raw_ostream.h"
 
-      - name: Sanitize CMakeLists (no hardcodes, includes, -fno-rtti, link c++/c++abi)
+          // Pass headers
+          #include "Flattening.h"
+          #include "FlatteningEnhanced.h"
+          #include "SplitBasicBlock.h"
+          #include "BogusControlFlow.h"
+          #include "MBAObfuscation.h"
+          #include "FunctionWrapper.h"
+          #include "VMFlatten.h"
+          #include "IndirectBranch.h"
+          #include "IndirectCall.h"
+          #include "StringEncryption.h"
+
+          using namespace llvm;
+
+          extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
+            return {
+              LLVM_PLUGIN_API_VERSION, "SsageObfuscator", "0.0",
+              [](PassBuilder &PB) {
+                errs() << "[Ssage] PMRegistration: registerPipelineStartEPCallback\n";
+                PB.registerPipelineStartEPCallback(
+                  [](ModulePassManager &MPM, OptimizationLevel OL) {
+                    errs() << "[Ssage] EP Start, OptLevel=" << (int)OL.getSpeedLevel() << "\n";
+
+                    // Module passes (run on Module)
+                    MPM.addPass(FunctionWrapperPass(true));
+                    MPM.addPass(IndirectBranchPass(true));
+                    MPM.addPass(StringEncryptionPass(true));
+
+                    // Function passes (wrap via adaptor)
+                    FunctionPassManager FPM;
+                    FPM.addPass(FlatteningEnhanced(true));
+                    FPM.addPass(FlatteningPass(true));
+                    FPM.addPass(SplitBasicBlockPass(true));
+                    FPM.addPass(BogusControlFlowPass(true));
+                    FPM.addPass(MBAObfuscation(true));
+                    FPM.addPass(VMFlattenPass(true));
+                    FPM.addPass(IndirectCallPass(true));
+
+                    MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+                  }
+                );
+              }
+            };
+          }
+          CPP
+
+      - name: Sanitize CMakeLists & link flags
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
           cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
 
-          # Bỏ hardcode compiler/ENV & include NDK cũ
           sed -i -E \
-            -e 's|^set\(CMAKE_C_COMPILER .*$|# [CI] patched|' \
-            -e 's|^set\(CMAKE_CXX_COMPILER .*$|# [CI] patched|' \
-            -e 's|^set\(ENV\{LLVM_HOME\} .*$|# [CI] patched|' \
-            -e 's|^set\(ENV\{LLVM_DIR\} .*$|# [CI] patched|' \
+            -e 's|^set\(CMAKE_C_COMPILER .*$|# patched|' \
+            -e 's|^set\(CMAKE_CXX_COMPILER .*$|# patched|' \
+            -e 's|^set\(ENV\{LLVM_HOME\} .*$|# patched|' \
+            -e 's|^set\(ENV\{LLVM_DIR\} .*$|# patched|' \
             "$D/CMakeLists.txt" || true
-          sed -i -E '/ndk-llvm\/out\/install\/linux-x86\/clang-dev\/include(\/c\+\+\/v1)?/d' "$D/CMakeLists.txt" || true
+          sed -i -E '/ndk-llvm\/out\/install\/linux-x86/d' "$D/CMakeLists.txt" || true
 
           grep -q 'find_package(LLVM' "$D/CMakeLists.txt" || printf '\nfind_package(LLVM REQUIRED CONFIG)\n' >> "$D/CMakeLists.txt"
           grep -q 'LLVM_INCLUDE_DIRS' "$D/CMakeLists.txt"   || printf '\ninclude_directories(${LLVM_INCLUDE_DIRS})\n' >> "$D/CMakeLists.txt"
           grep -q '/usr/include/c++/v1' "$D/CMakeLists.txt" || printf '\ninclude_directories(/usr/include/c++/v1)\n' >> "$D/CMakeLists.txt"
 
-          # Loại set_target_properties xấu (nếu có)
           awk '
             BEGIN{drop=0}
-            /^[[:space:]]*set_target_properties[[:space:]]*\([[:space:]]*SsageObfuscator[[:space:]]+PROPERTIES/ {drop=1; print("# [CI] drop bad set_target_properties"); next}
+            /^[[:space:]]*set_target_properties[[:space:]]*\([[:space:]]*SsageObfuscator[[:space:]]+PROPERTIES/ {drop=1; print("# drop bad set_target_properties"); next}
             drop && /^[[:space:]]*\)[[:space:]]*$/ {drop=0; next}
             drop==0 {print}
           ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
 
-          # ensure -fno-rtti
           {
-            echo '# [CI] ensure -fno-rtti'
+            echo '# ensure -fno-rtti'
             echo 'if (TARGET SsageObfuscator)'
             echo '  target_compile_options(SsageObfuscator PRIVATE -fno-rtti)'
+            echo '  target_link_libraries(SsageObfuscator PRIVATE c++ c++abi)'
             echo 'endif()'
           } >> "$D/CMakeLists.txt"
 
-          # Link libc++/c++abi
-          if grep -q 'add_library[[:space:]]*\([[:space:]]*SsageObfuscator' "$D/CMakeLists.txt"; then
-            awk '
-              { print }
-              /^add_library[[:space:]]*\([[:space:]]*SsageObfuscator/ { inlib=1 }
-              inlib && /^\)/ { print "target_link_libraries(SsageObfuscator PRIVATE c++ c++abi)"; inlib=0 }
-            ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
-          fi
-
-          # Dùng libc++ khi compile/link
           grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
           grep -q 'CMAKE_SHARED_LINKER_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++ -Wl,-rpath,/usr/lib")\n' >> "$D/CMakeLists.txt"
 
-          nl -ba "$D/CMakeLists.txt" | sed -n '1,260p'
-
-      - name: Clean build/
-        run: rm -rf build
-
-      - name: Configure (host LLVM14; libc++; C++17)
+      - name: Configure (LLVM14; C++17)
         env:
           LLVM_DIR: ${{ env.HOST_LLVM_DIR }}
           CC: ${{ env.CC }}
           CXX: ${{ env.CXX }}
         run: |
-          set -euo pipefail
+          set -eux
           D="${{ steps.detect.outputs.build_dir }}"
+          rm -rf build
           cmake -S "$D" -B build -G Ninja \
             -DLLVM_DIR="${LLVM_DIR}" \
             -DCMAKE_BUILD_TYPE=Release \
@@ -224,47 +230,20 @@ jobs:
         run: |
           set -eux
           f=$(find build -type f -name "*SsageObfuscator*.so" -o -name "SsageObfuscator.so" | head -n1 || true)
-          test -n "$f" || { echo "::error::plugin .so not found"; find build -maxdepth 3 -type f -printf '%p\n'; exit 1; }
+          test -n "$f" || { echo "::error::plugin .so not found"; exit 1; }
           echo "plugin=$f" >> "$GITHUB_OUTPUT"
           ls -l "$f" && file "$f"
-          echo "Undefined symbols:"
+          echo "--- nm -u (undefined) ---"
           nm -u "$f" | c++filt || true
 
-      - name: Inject fallback for xchacha symbol (and rebuild if needed)
-        id: inject_fallback
-        shell: bash
+      # Thêm runtime giả & tên hàm random để tránh skip/warn
+      - name: Provide crypto_runtime.bc & rand_funcs.txt
         run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
-          SO="${{ steps.find_plugin.outputs.plugin }}"
-          echo "Checking undefined symbols in: $SO"
-          if nm -u "$SO" | c++filt | grep -q "xchacha20_poly1305_encrypt"; then
-            echo ">> Adding fallback implementation for xchacha20_poly1305_encrypt"
-            printf '#include <vector>\n#include <cstdint>\n\n// Fallback *NON-CRYPTO*: chỉ copy plaintext, tag = 16 byte 0.\n// Mục tiêu: loại U-symbol để .so nạp được; KHÔNG dùng cho sản phẩm.\nvoid xchacha20_poly1305_encrypt(\n  const std::vector<unsigned char>& plaintext,\n  const std::vector<unsigned char>& key,\n  const std::vector<unsigned char>& nonce,\n  const std::vector<unsigned char>& ad,\n  std::vector<unsigned char>& ciphertext,\n  std::vector<unsigned char>& tag\n){\n  (void)key; (void)nonce; (void)ad;\n  ciphertext = plaintext;\n  tag.assign(16, 0);\n}' > "$D/src/ci_xchacha_fallback.cpp"
-            
-            grep -q 'ci_xchacha_fallback.cpp' "$D/CMakeLists.txt" || \
-              printf '\ntarget_sources(SsageObfuscator PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/ci_xchacha_fallback.cpp)\n' >> "$D/CMakeLists.txt"
-      
-            rm -rf build
-            cmake -S "$D" -B build -G Ninja \
-              -DLLVM_DIR="${{ env.HOST_LLVM_DIR }}" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_C_COMPILER="${{ env.CC }}" \
-              -DCMAKE_CXX_COMPILER="${{ env.CXX }}" \
-              -DCMAKE_CXX_STANDARD=17 \
-              -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
-              -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -Wl,-rpath,/usr/lib"
-            cmake --build build -j"$(nproc)"
-      
-            NEW_SO="$(readlink -f "$(find build -type f -name "*SsageObfuscator*.so" -o -name "SsageObfuscator.so" | head -n1)")"
-            echo "plugin=$NEW_SO" >> "$GITHUB_OUTPUT"
-            echo "Rebuilt plugin: $NEW_SO"
-            echo "Undefined symbols after rebuild:"
-            nm -u "$NEW_SO" | c++filt || true
-          else
-            echo ">> Symbol already resolved; no fallback needed."
-            echo "plugin=$SO" >> "$GITHUB_OUTPUT"
-          fi
+          set -eux
+          echo 'define void @__ollvm_crypto_runtime_marker() { ret void }' > rt.ll
+          llvm-as-14 rt.ll -o crypto_runtime.bc
+          printf "alpha\nbeta\ngamma\ndelta\n" > rand_funcs.txt
+          ls -l crypto_runtime.bc rand_funcs.txt
 
       - name: Setup NDK r25c
         id: setup-ndk
@@ -273,10 +252,10 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      - name: NDK compile test – annotated obf (NEW PM, -O0)
+      - name: NDK test – O0 (pipeline start hook)
         run: |
           set -euxo pipefail
-          PLUGIN="${{ steps.inject_fallback.outputs.plugin }}"
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
           NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
           "$CXX" --version
@@ -286,28 +265,49 @@ jobs:
           __attribute__((noinline))
           __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr icall"))))
           static void ultra(){ std::puts("NDK MAX obf (annotated)"); }
-
           __attribute__((noinline))
           __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr icall"))))
           static void ultra2(){ std::puts("NDK MAX obf 2 (annotated)"); }
-
           int main(){ ultra(); ultra2(); return 0; }
           EOF
+
+          # đặt các file mà pass tìm ở CWD
+          ls -l crypto_runtime.bc rand_funcs.txt || true
 
           "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
             -c test_max.cpp -o test_max.o
-          "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
-          file libtest_max.so || true
+          "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max_O0.so
+          file libtest_max_O0.so
+          echo "--- strings (tìm chuỗi cleartext) ---"
+          strings -a libtest_max_O0.so | grep -n "NDK MAX obf" || true
+
+      - name: NDK test – O1 (đảm bảo EP optimizer chạy)
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+
+          "$CXX" --target=aarch64-linux-android31 -O1 -fPIC \
+            -fpass-plugin="$PLUGIN" \
+            -c test_max.cpp -o test_max_O1.o
+          "$CXX" --target=aarch64-linux-android31 test_max_O1.o -shared -o libtest_max_O1.so
+          file libtest_max_O1.so
+          echo "--- strings (tìm chuỗi cleartext) ---"
+          strings -a libtest_max_O1.so | grep -n "NDK MAX obf" || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ssagepass-ndk-artifacts
           path: |
-            ${{ steps.inject_fallback.outputs.plugin }}
+            ${{ steps.find_plugin.outputs.plugin }}
             ${{ steps.detect.outputs.build_dir }}/CMakeLists.txt
             ${{ steps.detect.outputs.build_dir }}/CMakeLists.txt.orig
+            crypto_runtime.bc
+            rand_funcs.txt
             test_max.cpp
             test_max.o
-            libtest_max.so
+            libtest_max_O0.so
+            libtest_max_O1.so
