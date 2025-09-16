@@ -63,52 +63,54 @@ jobs:
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
 
-      - name: Patch sources for LLVM 14 (C++17, startswith, optional, Demote*, iterator vs begin/end)
+      - name: Patch sources for LLVM 14 (C++17, startswith, optional, Demote*)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
 
-          # C++17
+          # Bật C++17 để dùng std::optional/nullopt
           if grep -qE 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt"; then
             sed -i -E 's/CMAKE_CXX_STANDARD[[:space:]]+[0-9]+/CMAKE_CXX_STANDARD 17/' "$D/CMakeLists.txt"
           else
             printf '\nset(CMAKE_CXX_STANDARD 17)\n' >> "$D/CMakeLists.txt"
           fi
 
-          # StringRef::starts_with -> startswith
+          # LLVM 14: StringRef::starts_with -> startswith
           find "$D" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
             | xargs -0 sed -i 's/\.starts_with(/.startswith(/g'
 
-          # include <optional> khi dùng std::optional/nullopt
+          # Thêm <optional> nếu dùng std::optional/nullopt
           mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
           for f in "${OPT_FILES[@]}"; do
             grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
           done
 
-          # Utils.cpp: Demote* nhận Instruction*
-          [ -f "$D/src/Utils.cpp" ] && {
+          # Utils.cpp: Demote* nhận Instruction* (không phải optional<iterator>)
+          if [ -f "$D/src/Utils.cpp" ]; then
             perl -0777 -pe 's/DemotePHIToStack\s*\(\s*PN\s*,\s*insertPoint\s*\)/DemotePHIToStack(PN, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp" || true
             perl -0777 -pe 's/DemoteRegToStack\s*\(\s*\*I\s*,\s*false\s*,\s*insertPoint\s*\)/DemoteRegToStack(*I, false, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp" || true
-          }
+          fi
 
-          # VMFlatten.cpp: iterator insertionPoint -> Instruction*
-          [ -f "$D/src/VMFlatten.cpp" ] && {
+          # VMFlatten.cpp: insertionPoint là iterator → truyền &*insertionPoint
+          if [ -f "$D/src/VMFlatten.cpp" ]; then
             perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp" || true
             perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp" || true
-          }
+          fi
 
-          # BogusControlFlow.cpp: lấy iterator thay vì Instruction*
-          [ -f "$D/src/BogusControlFlow.cpp" ] && {
+          # BogusControlFlow.cpp: lấy iterator từ getFirstNonPHIOrDbgOrLifetime()
+          if [ -f "$D/src/BogusControlFlow.cpp" ]; then
             perl -0777 -pe 's/\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_][A-Za-z0-9_:\->\s]*)getFirstNonPHIOrDbgOrLifetime\(\)\s*;/\1 = \2getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' -i "$D/src/BogusControlFlow.cpp" || true
-          }
+          fi
 
-          # Tổng quát: so sánh với begin()/end() → dùng iterator
-          find "$D/src" -type f -name '*.cpp' -print0 | xargs -0 \
-            perl -0777 -pe 's/\b([A-Za-z_]\w*)\s*(!=|==)\s*([A-Za-z_][A-Za-z0-9_\.\->]*)\bend\(\)/\1->getIterator() \2 \3end()/g' -i
-          find "$D/src" -type f -name '*.cpp' -print0 | xargs -0 \
-            perl -0777 -pe 's/\b([A-Za-z_]\w*)\s*(!=|==)\s*([A-Za-z_][A-Za-z0-9_\.\->]*)\bbegin\(\)/\1->getIterator() \2 \3begin()/g' -i
+      - name: Undo accidental getIterator() in LegacyLowerSwitch & IndirectBranch
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+          # Nếu lỡ chèn ->getIterator() ở 2 file này thì bỏ đi (iterator chuẩn không cần)
+          [ -f "$D/src/LegacyLowerSwitch.cpp" ]   && sed -i 's/->getIterator()//g' "$D/src/LegacyLowerSwitch.cpp" || true
+          [ -f "$D/src/IndirectBranch.cpp" ]      && sed -i 's/->getIterator()//g' "$D/src/IndirectBranch.cpp"    || true
 
-      - name: Sanitize CMakeLists (remove hardcodes, add includes, libc++, -fno-rtti, link c++/c++abi)
+      - name: Sanitize CMakeLists (no hardcodes, add includes, libc++, -fno-rtti, link c++/c++abi)
         run: |
           set -euxo pipefail
           D="${{ steps.detect.outputs.build_dir }}"
@@ -123,12 +125,12 @@ jobs:
             "$D/CMakeLists.txt" || true
           sed -i -E '/ndk-llvm\/out\/install\/linux-x86\/clang-dev\/include(\/c\+\+\/v1)?/d' "$D/CMakeLists.txt" || true
 
-          # Bổ sung find_package + include LLVM/libc++
+          # Bổ sung LLVM & libc++ include
           grep -q 'find_package(LLVM' "$D/CMakeLists.txt" || printf '\nfind_package(LLVM REQUIRED CONFIG)\n' >> "$D/CMakeLists.txt"
           grep -q 'LLVM_INCLUDE_DIRS' "$D/CMakeLists.txt"   || printf '\ninclude_directories(${LLVM_INCLUDE_DIRS})\n' >> "$D/CMakeLists.txt"
           grep -q '/usr/include/c++/v1' "$D/CMakeLists.txt" || printf '\ninclude_directories(/usr/include/c++/v1)\n' >> "$D/CMakeLists.txt"
 
-          # Gỡ khối set_target_properties(SsageObfuscator PROPERTIES ...) gây lỗi
+          # Loại khối set_target_properties(... PROPERTIES ...) cũ nếu có
           awk '
             BEGIN{drop=0}
             /^[[:space:]]*set_target_properties[[:space:]]*\([[:space:]]*SsageObfuscator[[:space:]]+PROPERTIES/ {drop=1; print("# [CI] drop bad set_target_properties"); next}
@@ -136,14 +138,14 @@ jobs:
             drop==0 {print}
           ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
 
-          # Thêm -fno-rtti (không dùng heredoc để khỏi lỗi YAML)
+          # Đảm bảo -fno-rtti trên target (không dùng heredoc để tránh lỗi YAML)
           printf '%s\n' \
-            '# [CI] ensure -fno-rtti (replace legacy COMPILE_FLAGS on target)' \
+            '# [CI] ensure -fno-rtti' \
             'if (TARGET SsageObfuscator)' \
             '  target_compile_options(SsageObfuscator PRIVATE -fno-rtti)' \
             'endif()' >> "$D/CMakeLists.txt"
 
-          # Link libc++/c++abi
+          # Link libc++/c++abi (để khớp NDK/host)
           if grep -q 'add_library[[:space:]]*\([[:space:]]*SsageObfuscator' "$D/CMakeLists.txt"; then
             awk '
               { print }
