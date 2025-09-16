@@ -91,6 +91,35 @@ jobs:
           nl -ba "$D/src/Utils.cpp"       | sed -n '1,240p'   | sed -n '160,210p' || true
           nl -ba "$D/src/Flattening.cpp"  | sed -n '1,120p'   | sed -n '50,90p'   || true
 
+      - name: Patch for LLVM14 (C++17 + startswith + <optional> + Demote* fix)
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+
+          # 1) Bật C++17
+          if grep -qE 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt"; then
+            sed -i -E 's/CMAKE_CXX_STANDARD[[:space:]]+[0-9]+/CMAKE_CXX_STANDARD 17/' "$D/CMakeLists.txt"
+          else
+            printf '\nset(CMAKE_CXX_STANDARD 17)\n' >> "$D/CMakeLists.txt"
+          fi
+
+          # 2) LLVM14 API: .starts_with( ) -> .startswith( )
+          find "$D" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
+            | xargs -0 sed -i 's/\.starts_with(/.startswith(/g'
+
+          # 3) Thêm <optional> ở file có dùng std::optional/nullopt
+          mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
+          for f in "${OPT_FILES[@]}"; do
+            grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
+          done
+
+          # 4) LLVM14 Demote* nhận Instruction* chứ không phải optional<iterator>
+          #    Chuyển 'insertPoint' (optional<BB::iterator>) -> Instruction*
+          perl -0777 -pe 's/DemotePHIToStack\s*\(\s*PN\s*,\s*insertPoint\s*\)/DemotePHIToStack(PN, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp"
+          perl -0777 -pe 's/DemoteRegToStack\s*\(\s*\*I\s*,\s*false\s*,\s*insertPoint\s*\)/DemoteRegToStack(*I, false, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp"
+
+          echo "Patched Utils.cpp & others for LLVM14 compatibility."
+
       - name: Patch CMakeLists (sanitize + replace -fno-rtti block)
         run: |
           set -euxo pipefail
