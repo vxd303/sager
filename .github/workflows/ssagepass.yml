@@ -120,6 +120,20 @@ jobs:
 
           echo "Patched Utils.cpp & others for LLVM14 compatibility."
 
+      - name: Patch for LLVM14 (C++17 + startswith + <optional> + Demote* fix incl. VMFlatten)
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+
+          # (giữ nguyên các lệnh bạn đã có: nâng C++17, starts_with -> startswith, thêm <optional>, fix Utils.cpp ...)
+
+          # --- FIX bổ sung cho VMFlatten: insertionPoint (iterator) -> Instruction*
+          # DemotePHIToStack(phi, insertionPoint) => DemotePHIToStack(phi, &*insertionPoint)
+          perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp"
+
+          # Nếu có dùng DemoteRegToStack(..., false, insertionPoint) trong VMFlatten thì đổi tương tự
+          perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp"
+
       - name: Patch CMakeLists (sanitize + replace -fno-rtti block)
         run: |
           set -euxo pipefail
