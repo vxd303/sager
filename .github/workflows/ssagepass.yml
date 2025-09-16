@@ -64,6 +64,32 @@ jobs:
           echo "Found build dir: $BUILD_DIR"
           nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
           echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
+      - name: Patch for LLVM14 (C++17 + startswith + <optional>)
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+
+          # 1) Bật C++17 (thay vì 14)
+          if grep -qE 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt"; then
+            sed -i -E 's/CMAKE_CXX_STANDARD[[:space:]]+[0-9]+/CMAKE_CXX_STANDARD 17/' "$D/CMakeLists.txt"
+          else
+            printf '\nset(CMAKE_CXX_STANDARD 17)\n' >> "$D/CMakeLists.txt"
+          fi
+
+          # 2) Vá API LLVM: starts_with -> startswith (LLVM 14)
+          #    (chỉ đổi trong thư mục Obfuscation của repo này)
+          find "$D" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 \
+            | xargs -0 sed -i 's/\.starts_with(/.startswith(/g'
+
+          # 3) Bổ sung #include <optional> cho file có dùng std::optional/nullopt
+          mapfile -t OPT_FILES < <(grep -RIl --include='*.{cpp,h}' -e 'std::optional' -e 'std::nullopt' "$D" || true)
+          for f in "${OPT_FILES[@]}"; do
+            grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
+          done
+
+          echo "==== Quick diff around Utils.cpp & Flattening.cpp ===="
+          nl -ba "$D/src/Utils.cpp"       | sed -n '1,240p'   | sed -n '160,210p' || true
+          nl -ba "$D/src/Flattening.cpp"  | sed -n '1,120p'   | sed -n '50,90p'   || true
 
       - name: Patch CMakeLists (sanitize + replace -fno-rtti block)
         run: |
