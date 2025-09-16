@@ -97,6 +97,18 @@ jobs:
             perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$D/src/VMFlatten.cpp" || true
           fi
 
+      - name: Fix IPObfuscationContext for LLVM14 (splice basic blocks)
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+          F="$D/src/IPObfuscationContext.cpp"
+          if [ -f "$F" ]; then
+            # thay đúng câu lệnh thường gặp
+            sed -i 's/NF->splice(NF->begin(), F);/NF->getBasicBlockList().splice(NF->begin(), F.getBasicBlockList());/' "$F"
+            # phòng khi tên biến khác NF/F (vá tổng quát)
+            perl -0777 -pe 's/([A-Za-z_]\w*)->splice\(\s*\1->begin\(\)\s*,\s*([A-Za-z_]\w*)\s*\);/\1->getBasicBlockList().splice(\1->begin(), \2.getBasicBlockList());/g' -i "$F"
+          fi
+
       - name: Fix LegacyLowerSwitch for LLVM14 (iterator vs Instruction*)
         run: |
           set -euxo pipefail
