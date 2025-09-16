@@ -117,7 +117,7 @@ jobs:
           #    Chuyển 'insertPoint' (optional<BB::iterator>) -> Instruction*
           perl -0777 -pe 's/DemotePHIToStack\s*\(\s*PN\s*,\s*insertPoint\s*\)/DemotePHIToStack(PN, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp"
           perl -0777 -pe 's/DemoteRegToStack\s*\(\s*\*I\s*,\s*false\s*,\s*insertPoint\s*\)/DemoteRegToStack(*I, false, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$D/src/Utils.cpp"
-          perl -0777 -pe 's/\bi1\s*=\s*([A-Za-z_][A-Za-z0-9_:\->\s]*)getFirstNonPHIOrDbgOrLifetime\(\)\s*;/i1 = \1getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' -i "$D/src/BogusControlFlow.cpp"
+          perl -0777 -pe 's/=\s*([A-Za-z_][A-Za-z0-9_:\->\s]*)getFirstNonPHIOrDbgOrLifetime\(\)\s*;/= \1getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' -i "$D/src/BogusControlFlow.cpp"
 
           echo "Patched Utils.cpp & others for LLVM14 compatibility."
 
