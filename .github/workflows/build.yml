@@ -1,148 +1,45 @@
-name: build-ssagepass
+name: try-ndk-with-prebuilt-ssagepass
 
 on:
-  push: { branches: [ main, master ] }
-  pull_request:
   workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
 
 permissions: { contents: read }
 
 env:
-  SSAGEPASS_REPO: https://github.com/SsageParuders/SsagePass.git
-  SSAGEPASS_REF: ""   # pin SHA/nhánh nếu muốn
+  SSAGE_SO_URL: https://github.com/SsageParuders/SsagePass/releases/download/1.0/libSsageObfuscator.so
+  SSAGE_SO_SHA256: ""  # nếu muốn verify
 
 jobs:
-  build-and-ndk-smoke:
+  ndk-test:
     runs-on: ubuntu-22.04
-
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
 
-      - name: Install toolchain & deps
+      - name: Base deps (curl, unzip, 7z, libc++)
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # LLVM/Clang 14 host + dev (có CMake package)
-          sudo apt-get install -y llvm-14 llvm-14-dev llvm-14-tools clang-14
-          # Ninja, CMake, git, tiện ích
-          sudo apt-get install -y ninja-build cmake git curl file
-          # libc++ cho -stdlib=libc++
+          sudo apt-get install -y curl unzip p7zip-full
           sudo apt-get install -y libc++-14-dev libc++abi-14-dev || true
-
-      - name: Set toolchain env (host)
+      - name: Download prebuilt libSsageObfuscator.so (upstream)
+        id: fetch_so
         run: |
           set -euxo pipefail
-          echo "HOST_LLVM_DIR=/usr/lib/llvm-14/lib/cmake/llvm" >> "$GITHUB_ENV"
-          echo "CC=clang-14"  >> "$GITHUB_ENV"
-          echo "CXX=clang-14" >> "$GITHUB_ENV"
-
-      - name: Clone upstream SsagePass
-        id: clone
-        run: |
-          set -euxo pipefail
-          mkdir -p third_party && cd third_party
-          git clone --depth=1 "${SSAGEPASS_REPO}" SsagePass
-          cd SsagePass
-          if [ -n "${SSAGEPASS_REF}" ]; then
-            git fetch origin "${SSAGEPASS_REF}" && git checkout FETCH_HEAD
+          mkdir -p plugin
+          curl -L "$SSAGE_SO_URL" -o plugin/libSsageObfuscator.so
+          test -s plugin/libSsageObfuscator.so
+          if [ -n "$SSAGE_SO_SHA256" ]; then
+            echo "$SSAGE_SO_SHA256  plugin/libSsageObfuscator.so" | sha256sum -c -
           fi
-          echo "src_dir=$PWD" >> "$GITHUB_OUTPUT"
-          echo "Repo tree (depth 2):"
-          find . -maxdepth 2 -print
-
-      - name: Detect Obfuscation/CMakeLists (FIXED)
-        id: detect
-        run: |
-          set -euo pipefail
-          SRC="${{ steps.clone.outputs.src_dir }}"
-          BUILD_DIR=""
-          if [ -f "$SRC/Obfuscation/CMakeLists.txt" ]; then
-            BUILD_DIR="$SRC/Obfuscation"
-          else
-            mapfile -t CANDS < <(find "$SRC" -type f -name CMakeLists.txt -printf '%h\n' | sort -u)
-            if [ ${#CANDS[@]} -gt 0 ]; then
-              BUILD_DIR="${CANDS[0]}"
-            fi
-          fi
-          test -n "$BUILD_DIR" || { echo "::error::No CMakeLists found in repo"; exit 1; }
-          echo "Found build dir: $BUILD_DIR"
-          # In step này dùng BIẾN CỤC BỘ, KHÔNG dùng steps.detect.outputs.*
-          nl -ba "$BUILD_DIR/CMakeLists.txt" | sed -n '1,180p'
-          # xuất cho step SAU dùng
-          echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-
-      - name: Patch CMakeLists (un-hardcode; use libc++; C++14)
-        run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
-          cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
-          # Bỏ các hardcode compiler/ENV của tác giả
-          sed -i -E \
-            -e 's|^set\(CMAKE_C_COMPILER .*$|# [CI] patched|' \
-            -e 's|^set\(CMAKE_CXX_COMPILER .*$|# [CI] patched|' \
-            -e 's|^set\(ENV\{LLVM_HOME\} .*$|# [CI] patched|' \
-            -e 's|^set\(ENV\{LLVM_DIR\} .*$|# [CI] patched|' \
-            "$D/CMakeLists.txt" || true
-
-          # Bật libc++ & std=c++14
-          grep -q 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_STANDARD 14)\n' >> "$D/CMakeLists.txt"
-          if ! grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt"; then
-            printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
-          else
-            sed -i 's/CMAKE_CXX_FLAGS[^"]*"/& -stdlib=libc++/;' "$D/CMakeLists.txt" || true
-          fi
-
-          # Thay include path hardcode nếu có
-          sed -i -E \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include/c\+\+/v1|/usr/include/c++/v1|g' \
-            -e 's|/home/ssage/Android/ndk-llvm/out/install/linux-x86/clang-dev/include|/usr/lib/llvm-14/include|g' \
-            "$D/CMakeLists.txt" || true
-
-      - name: Configure (host LLVM 14 CMake)
-        env:
-          LLVM_DIR: ${{ env.HOST_LLVM_DIR }}
-          CC: ${{ env.CC }}
-          CXX: ${{ env.CXX }}
-        run: |
-          set -euo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
-          cmake -S "$D" -B build -G Ninja \
-            -DLLVM_DIR="${LLVM_DIR}" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER="${CC}" \
-            -DCMAKE_CXX_COMPILER="${CXX}" \
-            -DCMAKE_CXX_STANDARD=14 \
-            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++"
-
-      - name: Build
-        run: cmake --build build -j"$(nproc)"
-
-      - name: Locate built plugin
-        id: find_plugin
-        run: |
-          set -e
-          f=$(find build -type f -name "*SsageObfuscator*.so" -o -name "SsageObfuscator.so" | head -n1 || true)
-          test -n "$f" || { echo "::error::plugin .so not found"; find build -maxdepth 2 -type f -printf '%p\n'; exit 1; }
-          echo "plugin=$f" >> "$GITHUB_OUTPUT"
-          ls -l "$f" && file "$f"
-
-      - name: Smoke test (host clang-14, NEW PM)
-        run: |
-          set -euxo pipefail
-          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-          cat > smoke.cpp <<'EOF'
-          #include <cstdio>
-          __attribute((__annotate__(("fla split strenc"))))
-          static void secret(){ std::puts("hello"); }
-          int main(){ secret(); return 0; }
-          EOF
-          clang++-14 smoke.cpp -O2 -o smoke.app -fpass-plugin="$PLUGIN"
-          ./smoke.app || true
-
-      # ---------- Tuỳ chọn: thử load bằng NDK r25c (không làm fail job) ----------
-      - name: Setup NDK r25c
+          chmod a+r plugin/libSsageObfuscator.so
+          echo "plugin=$(pwd)/plugin/libSsageObfuscator.so" >> "$GITHUB_OUTPUT"
+          ls -l plugin
+      # --- PIN NDK r25c; nếu action lỗi 404, fallback tải tay ---
+      - name: Setup NDK r25c (preferred)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
@@ -150,20 +47,19 @@ jobs:
           add-to-path: true
         continue-on-error: true
 
-      - name: Fallback download NDK r25c
+      - name: Fallback:download NDK r25c from official link
         if: steps.setup-ndk.outcome != 'success'
         run: |
           set -euxo pipefail
           mkdir -p "$HOME/ndk"
           cd "$HOME/ndk"
-          curl -L -o android-ndk-r25c-linux.zip https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          curl -L -o android-ndk-r25c-linux.zip \
+            https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
           unzip -q android-ndk-r25c-linux.zip
           echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
           echo "NDK=$HOME/ndk/android-ndk-r25c" >> $GITHUB_ENV
           echo "$HOME/ndk/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
-
-      - name: NDK load test (continue-on-error)
-        continue-on-error: true
+      - name: Verify NDK clang (expect LLVM 14.x)
         run: |
           set -euxo pipefail
           if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
@@ -171,32 +67,97 @@ jobs:
           else
             NDK="${NDK:-$ANDROID_NDK_HOME}"
           fi
-          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
-          PLUGIN="${{ steps.find_plugin.outputs.plugin }}"
-
-          cat > ndk_test.cpp <<'EOF'
+          "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version
+      # ---------- MAX (ổn định): bỏ indibr/indcall/vm, giữ fla/split/strenc/bcf/mba/funcwrap ----------
+      - name: NDK compile test – MAX (NEW PM only, -O0)
+        id: test_max
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          cat > test_max.cpp <<'EOF'
           #include <cstdio>
-          __attribute((__annotate__(("fla split strenc"))))
-          static void f(){ std::puts("NDK compile OK"); }
-          int main(){ f(); return 0; }
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla split strenc bcf mba funcwrap vmf"))))
+          static void ultra(){ std::puts("NDK MAX obf (stable)"); }
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla split strenc bcf mba funcwrap vmf"))))
+          static void ultra2(){ std::puts("NDK MAX obf 2 (stable)"); }
+          int main(){ ultra(); ultra2(); return 0; }
           EOF
-
-          "$CXX" --target=aarch64-linux-android31 -O2 -fPIC \
+          # NEW PM only, -O0 để IR "hiền" hơn với Flattening
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
-            -c ndk_test.cpp -o ndk_test.o || true
-          "$CXX" --target=aarch64-linux-android31 ndk_test.o -shared -o libndk_test.so || true
-          file libndk_test.so || true
-
+            -c test_max.cpp -o test_max.o
+          "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
+          file libtest_max.so || true
+      # ---------- Fallback: loại hẳn Flattening nếu MAX vẫn crash ----------
+      - name: NDK compile test – MAX-no-fla (NEW PM only, -O0)
+        if: steps.test_max.outcome != 'success'
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          cat > test_max_nofla.cpp <<'EOF'
+          #include <cstdio>
+          __attribute__((noinline))
+          __attribute((__annotate__(("split strenc bcf mba funcwrap vmf"))))
+          static void ultra(){ std::puts("NDK MAX no-fla"); }
+          __attribute__((noinline))
+          __attribute((__annotate__(("split strenc bcf mba funcwrap vmf"))))
+          static void ultra2(){ std::puts("NDK MAX no-fla 2"); }
+          int main(){ ultra(); ultra2(); return 0; }
+          EOF
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
+            -fpass-plugin="$PLUGIN" \
+            -c test_max_nofla.cpp -o test_max_nofla.o
+          "$CXX" --target=aarch64-linux-android31 test_max_nofla.o -shared -o libtest_max_nofla.so
+          file libtest_max_nofla.so || true
+      # (Tuỳ chọn) Thử nạp kép + -mllvm để "đẩy kịch trần" — không làm fail CI
+      - name: Optional:double-load with -mllvm (ignore errors)
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          PLUGIN="${{ steps.fetch_so.outputs.plugin }}"
+          if [ -n "${{ steps.setup-ndk.outputs.ndk-path }}" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          else
+            NDK="${NDK:-$ANDROID_NDK_HOME}"
+          fi
+          CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          SRC="test_max.cpp"
+          if [ ! -f "$SRC" ]; then SRC="test_max_nofla.cpp"; fi
+          # Lưu ý: tên option -mllvm phụ thuộc plugin; nếu không có sẽ bị ignored/errored (không fail job).
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
+            -fpass-plugin="$PLUGIN" \
+            -Xclang -load -Xclang "$PLUGIN" \
+            -mllvm -split_num=7 \
+            -mllvm -bcf_prob=100 -mllvm -bcf_loop=3 -mllvm -bcf_cond_compl=5 \
+            -mllvm -fw_prob=100 -mllvm -fw_times=4 \
+            -c "$SRC" -o test_max_tuned.o || true
+          "$CXX" --target=aarch64-linux-android31 test_max_tuned.o -shared -o libtest_max_tuned.so || true
+          file libtest_max_tuned.so || true
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ssagepass-artifacts
+          name: ndk-prebuilt-test-strong-stable
           path: |
-            ${{ steps.find_plugin.outputs.plugin }}
-            ${{ steps.detect.outputs.build_dir }}/CMakeLists.txt
-            ${{ steps.detect.outputs.build_dir }}/CMakeLists.txt.orig
-            smoke.cpp
-            smoke.app
-            ndk_test.cpp
-            ndk_test.o
-            libndk_test.so
+            plugin/libSsageObfuscator.so
+            test_max.cpp
+            test_max.o
+            libtest_max.so
+            test_max_nofla.cpp
+            test_max_nofla.o
+            libtest_max_nofla.so
+            test_max_tuned.o
+            libtest_max_tuned.so
