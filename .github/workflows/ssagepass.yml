@@ -243,23 +243,23 @@ jobs:
           if nm -u "$SO" | c++filt | grep -q '^xchacha20_poly1305_encrypt('; then
             echo ">> Adding fallback implementation for xchacha20_poly1305_encrypt"
             cat <<'CPP' > "$D/src/ci_xchacha_fallback.cpp"
-#include <vector>
-#include <cstdint>
-// Fallback *NON-CRYPTO*: chỉ copy plaintext, tag = 16 byte 0.
-// Mục tiêu: loại U-symbol để .so nạp được; KHÔNG dùng cho sản phẩm.
-void xchacha20_poly1305_encrypt(
-  const std::vector<unsigned char>& plaintext,
-  const std::vector<unsigned char>& key,
-  const std::vector<unsigned char>& nonce,
-  const std::vector<unsigned char>& ad,
-  std::vector<unsigned char>& ciphertext,
-  std::vector<unsigned char>& tag
-){
-  (void)key; (void)nonce; (void)ad;
-  ciphertext = plaintext;
-  tag.assign(16, 0);
-}
-CPP
+            #include <vector>
+            #include <cstdint>
+            // Fallback *NON-CRYPTO*: chỉ copy plaintext, tag = 16 byte 0.
+            // Mục tiêu: loại U-symbol để .so nạp được; KHÔNG dùng cho sản phẩm.
+            void xchacha20_poly1305_encrypt(
+              const std::vector<unsigned char>& plaintext,
+              const std::vector<unsigned char>& key,
+              const std::vector<unsigned char>& nonce,
+              const std::vector<unsigned char>& ad,
+              std::vector<unsigned char>& ciphertext,
+              std::vector<unsigned char>& tag
+            ){
+              (void)key; (void)nonce; (void)ad;
+              ciphertext = plaintext;
+              tag.assign(16, 0);
+            }
+            CPP
 
             grep -q 'ci_xchacha_fallback.cpp' "$D/CMakeLists.txt" || \
               printf '\ntarget_sources(SsageObfuscator PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/ci_xchacha_fallback.cpp)\n' >> "$D/CMakeLists.txt"
@@ -324,15 +324,15 @@ CPP
           "$CXX" --version
 
           cat > test_max.cpp <<'EOF'
-#include <cstdio>
-__attribute__((noinline))
-__attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr icall"))))
-static void ultra(){ std::puts("NDK MAX obf (stable)"); }
-__attribute__((noinline))
-__attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr icall"))))
-static void ultra2(){ std::puts("NDK MAX obf 2 (stable)"); }
-int main(){ ultra(); ultra2(); return 0; }
-EOF
+          #include <cstdio>
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr icall"))))
+          static void ultra(){ std::puts("NDK MAX obf (stable)"); }
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr icall"))))
+          static void ultra2(){ std::puts("NDK MAX obf 2 (stable)"); }
+          int main(){ ultra(); ultra2(); return 0; }
+          EOF
 
           "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
