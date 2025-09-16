@@ -9,7 +9,7 @@ on:
 permissions: { contents: read }
 
 env:
-  SSAGE_SO_URL: https://github.com/SsageParuders/SsagePass/releases/download/1.0/libSsageObfuscator.so
+  SSAGE_SO_URL: https://github.com/vxd303/sager/releases/download/a/libSsageObfuscator.so
   SSAGE_SO_SHA256: ""  # nếu muốn verify
 
 jobs:
