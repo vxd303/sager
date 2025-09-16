@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  SSAGEPASS_REPO: https://github.com/lux-QAQ/SsagePass.git
+  SSAGEPASS_REPO: https://github.com/Veids/SsagePass.git
   SSAGEPASS_REF: ""   # có thể pin SHA/nhánh nếu muốn
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p third_party && cd third_party
-          git clone --depth=1 --branch main "${SSAGEPASS_REPO}" SsagePass  # Chỉ clone nhánh main
+          git clone --depth=1 --branch dev "${SSAGEPASS_REPO}" SsagePass  # Chỉ clone nhánh main
           cd SsagePass
           if [ -n "${SSAGEPASS_REF}" ]; then
             git fetch origin "${SSAGEPASS_REF}" && git checkout FETCH_HEAD
