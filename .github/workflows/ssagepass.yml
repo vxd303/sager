@@ -140,6 +140,25 @@ jobs:
             sed -i 's/\<getFirstNonPHIOrDbgOrLifetime()\s*;/getFirstNonPHIOrDbgOrLifetime()->getIterator();/g' "$F"
           fi
 
+
+          - name: Fix IPObfuscationContext splice (ptr vs ref) for LLVM14
+            run: |
+              set -euxo pipefail
+              D="${{ steps.detect.outputs.build_dir }}"
+              F="$D/src/IPObfuscationContext.cpp"
+              test -f "$F" || exit 0
+          
+              # Nếu lỡ sinh ra 'F.getBasicBlockList()' thì đổi về 'F->getBasicBlockList()'
+              sed -i -E 's/([A-Za-z_]\w*)\.getBasicBlockList\(\)/\1->getBasicBlockList()/g' "$F"
+          
+              # Đảm bảo splice chạy trên danh sách BB và dùng begin() của chính danh sách đó
+              # ...NF->getBasicBlockList().splice(NF->begin(),  F->getBasicBlockList())  ->  ...splice(NF->getBasicBlockList().begin(), F->getBasicBlockList())
+              perl -0777 -pe 's/([A-Za-z_]\w*)->getBasicBlockList\(\)\.splice\(\s*\1->begin\(\)\s*,/\1->getBasicBlockList().splice(\1->getBasicBlockList().begin(),/g' -i "$F"
+          
+              # Trường hợp dòng chính xác (tên biến NF/F) thì đảm bảo đúng mũi tên
+              sed -i 's/NF->getBasicBlockList().splice(NF->begin(), F.getBasicBlockList());/NF->getBasicBlockList().splice(NF->getBasicBlockList().begin(), F->getBasicBlockList());/' "$F" || true
+
+          
       - name: Sanitize CMakeLists (no hardcodes, add includes, libc++, -fno-rtti, link c++/c++abi)
         run: |
           set -euxo pipefail
@@ -191,23 +210,6 @@ jobs:
 
           nl -ba "$D/CMakeLists.txt" | sed -n '1,260p'
 
-          - name: Fix IPObfuscationContext splice (ptr vs ref) for LLVM14
-            run: |
-              set -euxo pipefail
-              D="${{ steps.detect.outputs.build_dir }}"
-              F="$D/src/IPObfuscationContext.cpp"
-              test -f "$F" || exit 0
-          
-              # Nếu lỡ sinh ra 'F.getBasicBlockList()' thì đổi về 'F->getBasicBlockList()'
-              sed -i -E 's/([A-Za-z_]\w*)\.getBasicBlockList\(\)/\1->getBasicBlockList()/g' "$F"
-          
-              # Đảm bảo splice chạy trên danh sách BB và dùng begin() của chính danh sách đó
-              # ...NF->getBasicBlockList().splice(NF->begin(),  F->getBasicBlockList())  ->  ...splice(NF->getBasicBlockList().begin(), F->getBasicBlockList())
-              perl -0777 -pe 's/([A-Za-z_]\w*)->getBasicBlockList\(\)\.splice\(\s*\1->begin\(\)\s*,/\1->getBasicBlockList().splice(\1->getBasicBlockList().begin(),/g' -i "$F"
-          
-              # Trường hợp dòng chính xác (tên biến NF/F) thì đảm bảo đúng mũi tên
-              sed -i 's/NF->getBasicBlockList().splice(NF->begin(), F.getBasicBlockList());/NF->getBasicBlockList().splice(NF->getBasicBlockList().begin(), F->getBasicBlockList());/' "$F" || true
-          
       - name: Clean build/
         run: rm -rf build
 
