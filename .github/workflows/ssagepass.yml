@@ -358,58 +358,54 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      - name: Build crypto_runtime.bc for StringEncryption
+      - name: Build crypto_runtime.bc (with BLAKE3 portable)
         shell: bash
         run: |
           set -euxo pipefail
           D="/home/runner/work/sager/sager/third_party/SsagePass/Obfuscation"
           mkdir -p "$HOME/.ollvm"
       
-          # Ưu tiên NDK clang++; fallback sang clang-14 nếu NDK chưa sẵn
-          if [ -n "${{ steps.setup-ndk.outputs.ndk-path || '' }}" ] && \
-             [ -x "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]; then
-            CXX="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
-            TARGET="--target=aarch64-linux-android31"
-          elif [ -x "/opt/hostedtoolcache/ndk/r25c/x64/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]; then
+          # Prefer NDK toolchain
+          if [ -x "/opt/hostedtoolcache/ndk/r25c/x64/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]; then
             CXX="/opt/hostedtoolcache/ndk/r25c/x64/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+            CC="/opt/hostedtoolcache/ndk/r25c/x64/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
             TARGET="--target=aarch64-linux-android31"
           else
-            CXX="clang-14"
-            TARGET=""   # host clang có thể không có sysroot Android; để trống nếu fallback
+            CXX="clang++-14"
+            CC="clang-14"
+            TARGET=""
           fi
       
-          # Kiểm tra header
-          HDR="$D/include/crypto_runtime.h"
-          ls -l "$HDR"
+          # Paths
+          OUT_DIR="$HOME/.ollvm"
+          CRYPTO_CPP="$D/src/crypto_runtime.cpp"
+          B3_DIR="$D/blake3"
+          B3_INC="-I$B3_DIR"
+          INC="-I$D/include $B3_INC"
       
-          OUT="$HOME/.ollvm/crypto_runtime.bc"
-          SRC_CPP="$D/src/crypto_runtime.cpp"
+          # Compile BLAKE3 (portable only, tránh phụ thuộc NEON)
+          $CC $TARGET -O2 -fPIC -emit-llvm -c -DBLAKE3_USE_PORTABLE=1 $B3_INC \
+            "$B3_DIR/blake3.c"             -o "$OUT_DIR/blake3.c.bc"
+          $CC $TARGET -O2 -fPIC -emit-llvm -c -DBLAKE3_USE_PORTABLE=1 $B3_INC \
+            "$B3_DIR/blake3_dispatch.c"    -o "$OUT_DIR/blake3_dispatch.c.bc"
+          $CC $TARGET -O2 -fPIC -emit-llvm -c -DBLAKE3_USE_PORTABLE=1 $B3_INC \
+            "$B3_DIR/blake3_portable.c"    -o "$OUT_DIR/blake3_portable.c.bc"
       
-          if [ -f "$SRC_CPP" ]; then
-            echo "[info] Found crypto_runtime.cpp -> compiling to bitcode"
-            "$CXX" $TARGET -std=gnu++17 -O2 -fPIC -emit-llvm -c \
-              -I"$D/include" \
-              "$SRC_CPP" -o "$OUT"
-          else
-            echo "[warn] crypto_runtime.cpp not found -> write minimal NON-CRYPTO stub"
-            cat > "$HOME/.ollvm/crypto_runtime_stub.c" <<'C'
-            #ifdef __cplusplus
-            extern "C" {
-            #endif
-            void __aead_xchacha20_poly1305_decrypt(void) {}
-            void __aead_xchacha20_poly1305_encrypt(void) {}
-            #ifdef __cplusplus
-            }
-            #endif
-          C
-            "$CXX" $TARGET -O2 -fPIC -emit-llvm -c \
-              "$HOME/.ollvm/crypto_runtime_stub.c" -o "$OUT" || true
-          fi
+          # Compile crypto_runtime.cpp
+          $CXX $TARGET -std=gnu++17 -O2 -fPIC -emit-llvm -c $INC \
+            "$CRYPTO_CPP" -o "$OUT_DIR/crypto_runtime_core.bc"
       
-          # Tuỳ plugin: nhiều bản tìm thêm ở CWD -> tạo symlink cho chắc
-          ln -sf "$OUT" ./crypto_runtime.bc || true
-          ls -l "$OUT" ./crypto_runtime.bc || true
-
+          # Link all into one bc (dùng host llvm-link-14)
+          /usr/bin/llvm-link-14 \
+            "$OUT_DIR/crypto_runtime_core.bc" \
+            "$OUT_DIR/blake3.c.bc" \
+            "$OUT_DIR/blake3_dispatch.c.bc" \
+            "$OUT_DIR/blake3_portable.c.bc" \
+            -o "$OUT_DIR/crypto_runtime.bc"
+      
+          # Một số plugin còn dò ở CWD
+          ln -sf "$OUT_DIR/crypto_runtime.bc" ./crypto_runtime.bc || true
+          ls -l "$OUT_DIR/crypto_runtime.bc" ./crypto_runtime.bc
 
       - name: NDK compile test — annotations (NEW PM, -O0)
         run: |
