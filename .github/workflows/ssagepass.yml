@@ -430,11 +430,11 @@ jobs:
             $INC1 $INC2 "$D/src/crypto_runtime.cpp" -o "$HOME/.ollvm/crypto_runtime_core.bc"
       
           "$CC"  --target=aarch64-linux-android31 -O2 -fPIC -emit-llvm -c $INC2 \
-            "$D/blake3/blake3.c"              -o "$HOME/.ollvm/blake3.c.bc"
+            "$D/black3/blake3.c"              -o "$HOME/.ollvm/blake3.c.bc"
           "$CC"  --target=aarch64-linux-android31 -O2 -fPIC -emit-llvm -c $INC2 \
-            "$D/blake3/blake3_dispatch.c"     -o "$HOME/.ollvm/blake3_dispatch.c.bc"
+            "$D/black3/blake3_dispatch.c"     -o "$HOME/.ollvm/blake3_dispatch.c.bc"
           "$CC"  --target=aarch64-linux-android31 -O2 -fPIC -emit-llvm -c $INC2 \
-            "$D/blake3/blake3_portable.c"     -o "$HOME/.ollvm/blake3_portable.c.bc"
+            "$D/black3/blake3_portable.c"     -o "$HOME/.ollvm/blake3_portable.c.bc"
       
           # 4) Link các .bc bằng llvm-link của NDK (đúng version)
           "$LLVMLINK" \
