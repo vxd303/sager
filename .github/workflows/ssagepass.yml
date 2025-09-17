@@ -75,17 +75,32 @@ jobs:
             grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
           done
 
-      - name: Build strip-inline-asm plugin (ABI-safe)
+      - name: Build strip-inline-asm plugin (robust CXX detection)
         shell: bash
         run: |
           set -euo pipefail
+      
           ROOT="$GITHUB_WORKSPACE"
           STRIP_DIR="$ROOT/stripper"
-          NDK=/opt/hostedtoolcache/ndk/r25c/x64
-          HOST_CLANGXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
-      
           mkdir -p "$STRIP_DIR"
       
+          # --- Chọn compiler C++ khả dụng ---
+          NDK=/opt/hostedtoolcache/ndk/r25c/x64
+          CAND="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          if [ -x "$CAND" ]; then
+            HOST_CLANGXX="$CAND"
+          elif command -v clang++-14 >/dev/null 2>&1; then
+            HOST_CLANGXX="$(command -v clang++-14)"
+          elif command -v clang++ >/dev/null 2>&1; then
+            HOST_CLANGXX="$(command -v clang++)"
+          else
+            echo "No clang++ found (NDK or system). Aborting."
+            exit 1
+          fi
+          echo "Using CXX: $HOST_CLANGXX"
+          "$HOST_CLANGXX" --version || true
+      
+          # --- File CMake & mã nguồn pass ---
           cat > "$STRIP_DIR/CMakeLists.txt" <<'CMAKE'
           cmake_minimum_required(VERSION 3.13)
           project(StripInlineAsm LANGUAGES C CXX)
@@ -99,7 +114,7 @@ jobs:
             StripInlineAsm.cpp
             Register.cpp
           )
-          # Dùng libc++ để khớp ABI với clang++ NDK
+          # Bắt buộc dùng libc++ để khớp ABI với clang++ loader
           target_compile_options(StripInlineAsm PRIVATE -stdlib=libc++)
           target_link_options(StripInlineAsm PRIVATE -stdlib=libc++ -Wl,-rpath,/usr/lib -Wl,-rpath,/usr/lib/llvm-14/lib)
           target_compile_definitions(StripInlineAsm PRIVATE -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS)
@@ -135,7 +150,6 @@ jobs:
       
           PreservedAnalyses StripInlineAsmPass::run(Module &M, ModuleAnalysisManager &) {
             Triple TT(M.getTargetTriple());
-            // Giữ inline asm nếu target là x86/x64
             if (TT.isX86()) {
               errs() << "[StripInlineAsm] target is x86 — keep inline asm\n";
               return PreservedAnalyses::all();
@@ -143,7 +157,6 @@ jobs:
             errs() << "[StripInlineAsm] running on target " << TT.str() << "\n";
             bool Changed = false;
       
-            // 1) Xoá module-level inline asm
             if (!M.getModuleInlineAsm().empty()) {
               errs() << "[StripInlineAsm] cleared module inline asm (size="
                      << (unsigned)M.getModuleInlineAsm().size() << ")\n";
@@ -151,7 +164,6 @@ jobs:
               Changed = true;
             }
       
-            // 2) Xoá các call InlineAsm trong function
             for (Function &F : M) {
               for (auto &BB : F) {
                 for (auto I = BB.begin(), E = BB.end(); I != E;) {
@@ -183,12 +195,10 @@ jobs:
             return {
               LLVM_PLUGIN_API_VERSION, "StripInlineAsm", "1.0",
               [](PassBuilder &PB) {
-                // Đầu pipeline
                 PB.registerPipelineStartEPCallback(
                   [](ModulePassManager &MPM, OptimizationLevel) {
                     MPM.addPass(StripInlineAsmPass());
                   });
-                // Cuối pipeline
                 PB.registerOptimizerLastEPCallback(
                   [](ModulePassManager &MPM, OptimizationLevel) {
                     MPM.addPass(StripInlineAsmPass());
@@ -197,10 +207,11 @@ jobs:
             };
           }
           CPP
-  
+      
+          # --- Gọi CMake, truyền CXX tìm được ---
           cmake -S "$STRIP_DIR" -B "$STRIP_DIR/build" -G Ninja \
             -DLLVM_DIR="/usr/lib/llvm-14/lib/cmake/llvm" \
-            -DCMAKE_C_COMPILER=clang-14 \
+            -DCMAKE_C_COMPILER="$(command -v clang-14 || echo clang)" \
             -DCMAKE_CXX_COMPILER="$HOST_CLANGXX" \
             -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
             -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -Wl,-rpath,/usr/lib -Wl,-rpath,/usr/lib/llvm-14/lib" \
@@ -208,9 +219,9 @@ jobs:
             -DCMAKE_DISABLE_FIND_PACKAGE_FFI=ON
       
           cmake --build "$STRIP_DIR/build" -j"$(nproc)"
+      
           echo "strip_plugin=$STRIP_DIR/build/libStripInlineAsm.so" >> "$GITHUB_OUTPUT"
 
-      
           #### 4) Ép đăng ký vào PMRegistration.cpp (đầu và cuối pipeline)
           f="$D/src/PMRegistration.cpp"
           test -f "$f" || { echo "::error::PMRegistration.cpp not found: $f"; exit 1; }
