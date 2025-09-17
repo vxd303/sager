@@ -358,6 +358,54 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
+      - name: Patch crypto_runtime.cpp (C++17 + portable syscall)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          D="/home/runner/work/sager/sager/third_party/SsagePass/Obfuscation"
+          F="$D/src/crypto_runtime.cpp"
+      
+          # Bổ sung headers nếu thiếu
+          add_inc() { grep -qF "$1" "$F" || sed -i "1i $1" "$F"; }
+          add_inc '#include <unistd.h>'
+          add_inc '#include <sys/syscall.h>'
+          add_inc '#include <sys/ptrace.h>'
+          add_inc '#include <sys/mman.h>'
+      
+          # Chuẩn hoá macro SYS_* nếu môi trường chỉ có __NR_*
+          perl -0777 -i -pe '
+          BEGIN{$x=qq(
+          #ifndef SYS_MPROTECT
+          #define SYS_MPROTECT __NR_mprotect
+          #endif
+          #ifndef SYS_READLINKAT
+          #define SYS_READLINKAT __NR_readlinkat
+          #endif
+          #ifndef SYS_UNLINKAT
+          #define SYS_UNLINKAT __NR_unlinkat
+          #endif
+          #ifndef SYS_WRITE
+          #define SYS_WRITE __NR_write
+          #endif
+          #ifndef SYS_PTRACE
+          #define SYS_PTRACE __NR_ptrace
+          #endif
+          );}
+          s!(#include\s*<sys/syscall\.h>.*?\n)!$1$x!s
+          ' "$F"
+              # Thay toàn bộ định nghĩa hàm direct_syscall… (loại bỏ inline asm + C++20)
+              perl -0777 -i -pe '
+          s!
+          static\s+long\s+NO_IC_INSTRUMENT\s+direct_syscall\s*\([^)]*\)\s*\{
+          .*?
+          ^\}
+          !template <typename... Args>
+          static long NO_IC_INSTRUMENT direct_syscall(long number, Args... args) {
+           // Dùng syscall(2) portable cho x86-64/aarch64; cast về long cho an toàn ABI.
+           return (long)::syscall(number, (long)args...);
+          }
+          !msx
+          ' "$F"
       - name: Build crypto_runtime.bc (with BLAKE3 portable)
         shell: bash
         run: |
