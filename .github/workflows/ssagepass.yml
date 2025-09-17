@@ -351,6 +351,39 @@ jobs:
             echo ">> xchacha symbol already resolved; skip fallback."
           fi
 
+      - name: Provide crypto_runtime.bc for StringEncryption
+        shell: bash
+        run: |
+          set -euxo pipefail
+          D="/home/runner/work/sager/sager/third_party/SsagePass/Obfuscation"
+          mkdir -p "$HOME/.ollvm"
+      
+          # 1) Nếu có file chuẩn -> compile thành .bc đúng target aarch64 Android
+          if [ -f "$D/src/crypto_runtime.cpp" ]; then
+            echo "[info] Found crypto_runtime.cpp -> compiling to bitcode"
+            /opt/hostedtoolcache/ndk/r25c/x64/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ \
+              --target=aarch64-linux-android31 -O2 -fPIC -emit-llvm -c \
+              "$D/src/crypto_runtime.cpp" -o "$HOME/.ollvm/crypto_runtime.bc"
+          else
+            echo "[warn] crypto_runtime.cpp not found -> write minimal stub (NON-CRYPTO)"
+            F="$HOME/.ollvm/crypto_runtime_stub.c"
+            : > "$F"
+            # Viết stub C đơn giản – tên đúng để linker không phàn nàn.
+            # LƯU Ý: Đây chỉ là STUB PHI MÃ HOÁ, dùng cho CI/đánh giá pipeline.
+            printf '%s\n' \
+              '#include <stddef.h>' \
+              '#include <stdint.h>' \
+              'extern "C" void __aead_xchacha20_poly1305_decrypt(void) { /* stub */ }' \
+              'extern "C" void __aead_xchacha20_poly1305_encrypt(void) { /* stub */ }' \
+              > "$F"
+            /opt/hostedtoolcache/ndk/r25c/x64/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ \
+              --target=aarch64-linux-android31 -O2 -fPIC -emit-llvm -c \
+              "$F" -o "$HOME/.ollvm/crypto_runtime.bc" || true
+            # Nếu muốn nghiêm túc hoá string enc: hãy dùng bản crypto_runtime.cpp thật của dự án.
+          fi
+      
+          ls -l "$HOME/.ollvm/crypto_runtime.bc"
+
       - name: Setup NDK r25c
         id: setup-ndk
         uses: nttld/setup-ndk@v1
