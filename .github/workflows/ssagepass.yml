@@ -417,19 +417,12 @@ jobs:
           CC="$BIN/clang"
           LLVMLINK="$BIN/llvm-link"   # dùng llvm-link của NDK (14.0.7)
       
-          # 1) Quấn các macro SYS_* loại "số nguyên" để không đè lên bản __NR_*
-          F="$D/src/crypto_runtime.cpp"
-          perl -0777 -i -pe '
-            s/^(\s*#\s*define\s+SYS_(WRITE|MPROTECT|UNLINKAT|READLINKAT|PTRACE)\s+\d+\s*)$
-             /#ifndef SYS_$2\n$1\n#endif\n/gmx
-          ' "$F"
-      
           # (Nếu trước đó bạn có bước patch C++20->C++17 + direct_syscall() dùng ::syscall,
           #  hãy giữ nguyên — không cần lặp lại ở đây.)
       
           # 2) Đường include cho headers
           INC1="-I$D/include"
-          INC2="-I$D/blake3"
+          INC2="-I$D/black3"
       
           # 3) Biên dịch từng phần sang LLVM bitcode bằng NDK 14.0.7
           mkdir -p "$HOME/.ollvm"
