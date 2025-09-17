@@ -136,41 +136,60 @@ jobs:
             };
           }
           CPP
-
-      - name: Sanitize CMakeLists (no hardcodes; libc++; -fno-rtti; link c++/c++abi)
-        run: |
-          set -euxo pipefail
-          D="${{ steps.detect.outputs.build_dir }}"
-          cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
-          # Bỏ hardcode compiler/ENV
-          sed -i -E \
-            -e 's|^set\(CMAKE_C_COMPILER .*$|# [CI] patched|' \
-            -e 's|^set\(CMAKE_CXX_COMPILER .*$|# [CI] patched|' \
-            -e 's|^set\(ENV\{LLVM_HOME\} .*$|# [CI] patched|' \
-            -e 's|^set\(ENV\{LLVM_DIR\} .*$|# [CI] patched|' \
-            "$D/CMakeLists.txt" || true
-          # include LLVM + libc++
-          grep -q 'find_package(LLVM' "$D/CMakeLists.txt" || printf '\nfind_package(LLVM REQUIRED CONFIG)\n' >> "$D/CMakeLists.txt"
-          grep -q 'LLVM_INCLUDE_DIRS' "$D/CMakeLists.txt" || printf '\ninclude_directories(${LLVM_INCLUDE_DIRS})\n' >> "$D/CMakeLists.txt"
-          grep -q '/usr/include/c++/v1' "$D/CMakeLists.txt" || printf '\ninclude_directories(/usr/include/c++/v1)\n' >> "$D/CMakeLists.txt"
-          # ensure -fno-rtti
-          {
-            echo ''
-            echo '# [CI] ensure -fno-rtti'
-            echo 'if (TARGET SsageObfuscator)'
-            echo '  target_compile_options(SsageObfuscator PRIVATE -fno-rtti)'
-            echo 'endif()'
-          } >> "$D/CMakeLists.txt"
-          # Link libc++/c++abi
-          if grep -q 'add_library[[:space:]]*\([[:space:]]*SsageObfuscator' "$D/CMakeLists.txt"; then
-            awk '
-              { print }
-              /^add_library[[:space:]]*\([[:space:]]*SsageObfuscator/ { inlib=1 }
-              inlib && /^\)/ { print "target_link_libraries(SsageObfuscator PRIVATE c++ c++abi)"; inlib=0 }
-            ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
-          fi
-          grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
-          grep -q 'CMAKE_SHARED_LINKER_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++ -Wl,-rpath,/usr/lib")\n' >> "$D/CMakeLists.txt"
+            - name: Sanitize CMakeLists (drop all set_target_properties; add includes, -fno-rtti, link c++/c++abi)
+              run: |
+                set -euxo pipefail
+                D="${{ steps.detect.outputs.build_dir }}"
+                cp "$D/CMakeLists.txt" "$D/CMakeLists.txt.orig" || true
+      
+                echo "=== HEAD (original) ==="
+                nl -ba "$D/CMakeLists.txt" | sed -n '1,120p' || true
+      
+                # 1) Bỏ hardcode compiler/ENV nếu có
+                sed -i -E \
+                  -e 's|^set\(CMAKE_C_COMPILER .*$|# [CI] patched|' \
+                  -e 's|^set\(CMAKE_CXX_COMPILER .*$|# [CI] patched|' \
+                  -e 's|^set\(ENV\{LLVM_HOME\} .*$|# [CI] patched|' \
+                  -e 's|^set\(ENV\{LLVM_DIR\} .*$|# [CI] patched|' \
+                  "$D/CMakeLists.txt" || true
+      
+                # 2) XÓA TOÀN BỘ set_target_properties(...) (mọi biến thể, đa dòng)
+                perl -0777 -pe 's/set_target_properties\s*\([\s\S]*?\)\s*//g' -i "$D/CMakeLists.txt"
+      
+                # 3) Bảo đảm C++17 + include thư mục LLVM & libc++
+                grep -q 'find_package(LLVM' "$D/CMakeLists.txt" || printf '\nfind_package(LLVM REQUIRED CONFIG)\n' >> "$D/CMakeLists.txt"
+                if grep -qE 'CMAKE_CXX_STANDARD' "$D/CMakeLists.txt"; then
+                  sed -i -E 's/CMAKE_CXX_STANDARD[[:space:]]+[0-9]+/CMAKE_CXX_STANDARD 17/' "$D/CMakeLists.txt"
+                else
+                  printf '\nset(CMAKE_CXX_STANDARD 17)\n' >> "$D/CMakeLists.txt"
+                fi
+                grep -q 'LLVM_INCLUDE_DIRS' "$D/CMakeLists.txt" || printf '\ninclude_directories(${LLVM_INCLUDE_DIRS})\n' >> "$D/CMakeLists.txt"
+                grep -q '/usr/include/c++/v1' "$D/CMakeLists.txt" || printf '\ninclude_directories(/usr/include/c++/v1)\n' >> "$D/CMakeLists.txt"
+      
+                # 4) Thêm -fno-rtti bằng target_compile_options (nếu target tồn tại)
+                {
+                  echo ''
+                  echo '# [CI] ensure -fno-rtti'
+                  echo 'if (TARGET SsageObfuscator)'
+                  echo '  target_compile_options(SsageObfuscator PRIVATE -fno-rtti)'
+                  echo 'endif()'
+                } >> "$D/CMakeLists.txt"
+      
+                # 5) Link libc++/c++abi cho target plugin
+                if grep -q 'add_library[[:space:]]*\([[:space:]]*SsageObfuscator' "$D/CMakeLists.txt"; then
+                  awk '
+                    { print }
+                    /^add_library[[:space:]]*\([[:space:]]*SsageObfuscator/ { inlib=1 }
+                    inlib && /^\)/ { print "target_link_libraries(SsageObfuscator PRIVATE c++ c++abi)"; inlib=0 }
+                  ' "$D/CMakeLists.txt" > "$D/CMakeLists.txt.ci" && mv "$D/CMakeLists.txt.ci" "$D/CMakeLists.txt"
+                fi
+      
+                # 6) Thêm flags mặc định khi build
+                grep -q 'CMAKE_CXX_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")\n' >> "$D/CMakeLists.txt"
+                grep -q 'CMAKE_SHARED_LINKER_FLAGS' "$D/CMakeLists.txt" || printf '\nset(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -stdlib=libc++ -Wl,-rpath,/usr/lib")\n' >> "$D/CMakeLists.txt"
+      
+                echo "=== HEAD (sanitized) ==="
+                nl -ba "$D/CMakeLists.txt" | sed -n '1,160p' || true
 
       - name: Configure (host LLVM14)
         env:
