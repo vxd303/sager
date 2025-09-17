@@ -245,6 +245,29 @@ jobs:
             nl -ba "$F" | sed -n '810,840p'
           fi
 
+      - name: Patch IPObfuscationContext for LLVM14 (splice BasicBlock list)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+          F="$D/src/IPObfuscationContext.cpp"
+          test -f "$F" || exit 0
+      
+          # Trường hợp hay gặp: NF->splice(NF->begin(), F);
+          sed -i 's/NF->splice(NF->begin(), F);/NF->getBasicBlockList().splice(NF->getBasicBlockList().begin(), F->getBasicBlockList());/' "$F" || true
+      
+          # Vá tổng quát: X->splice(X->begin(), Y)  ->  X->getBasicBlockList().splice(X->getBasicBlockList().begin(), Y->getBasicBlockList())
+          perl -0777 -pe 's/(\b[A-Za-z_]\w*)->splice\(\s*\1->begin\(\)\s*,\s*([A-Za-z_]\w*)\s*\)/$1->getBasicBlockList().splice($1->getBasicBlockList().begin(), $2->getBasicBlockList())/g' -i "$F"
+      
+          # Nếu lỡ dùng dấu chấm (biến không phải con trỏ) thì cũng chuyển tương tự
+          perl -0777 -pe 's/(\b[A-Za-z_]\w*)\.splice\(\s*\1\.begin\(\)\s*,\s*([A-Za-z_]\w*)\s*\)/$1.getBasicBlockList().splice($1.getBasicBlockList().begin(), $2.getBasicBlockList())/g' -i "$F"
+      
+          # Chuẩn hoá: mọi 'X.getBasicBlockList()' về 'X->getBasicBlockList()' nếu X là con trỏ
+          sed -i -E 's/([A-Za-z_]\w*)\.getBasicBlockList\(\)/\1->getBasicBlockList()/g' "$F"
+      
+          echo "=== Patched context (around line ~215) ==="
+          nl -ba "$F" | sed -n '200,235p'
+
       - name: Configure (host LLVM14)
         env:
           LLVM_DIR: ${{ env.HOST_LLVM_DIR }}
