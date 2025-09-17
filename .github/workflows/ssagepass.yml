@@ -75,17 +75,45 @@ jobs:
             grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
           done
 
-      - name: Force-strip x86 inline asm on non-x86 targets (AArch64)
+      - name: Build strip-inline-asm plugin (ABI-safe)
         shell: bash
         run: |
           set -euo pipefail
-          D="$GITHUB_WORKSPACE/third_party/SsagePass/Obfuscation"
-          test -d "$D" || { echo "::error::Not found: $D"; exit 1; }
+          ROOT="$GITHUB_WORKSPACE"
+          STRIP_DIR="$ROOT/stripper"
+          NDK=/opt/hostedtoolcache/ndk/r25c/x64
+          HOST_CLANGXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
       
-          mkdir -p "$D/include" "$D/src"
+          mkdir -p "$STRIP_DIR"
       
-          #### 1) Header
-          cat > "$D/include/StripInlineAsm.h" <<'EOF'
+          cat > "$STRIP_DIR/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.13)
+          project(StripInlineAsm LANGUAGES C CXX)
+          enable_language(C)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          find_package(LLVM 14 REQUIRED CONFIG)
+          include_directories(${LLVM_INCLUDE_DIRS})
+          add_definitions(${LLVM_DEFINITIONS})
+          add_library(StripInlineAsm MODULE
+            StripInlineAsm.cpp
+            Register.cpp
+          )
+          # Dùng libc++ để khớp ABI với clang++ NDK
+          target_compile_options(StripInlineAsm PRIVATE -stdlib=libc++)
+          target_link_options(StripInlineAsm PRIVATE -stdlib=libc++ -Wl,-rpath,/usr/lib -Wl,-rpath,/usr/lib/llvm-14/lib)
+          target_compile_definitions(StripInlineAsm PRIVATE -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS)
+          target_include_directories(StripInlineAsm PRIVATE ${LLVM_INCLUDE_DIRS})
+          if (NOT LLVM_ENABLE_RTTI)
+            target_compile_options(StripInlineAsm PRIVATE -fno-rtti)
+          endif()
+          set_target_properties(StripInlineAsm PROPERTIES
+            OUTPUT_NAME "StripInlineAsm"
+            PREFIX "lib"
+          )
+          CMAKE
+      
+          cat > "$STRIP_DIR/StripInlineAsm.h" <<'HDR'
           #pragma once
           #include "llvm/IR/PassManager.h"
           namespace llvm {
@@ -94,31 +122,28 @@ jobs:
             PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
           };
           } // namespace llvm
-          EOF
+          HDR
       
-          #### 2) Implementation (có log)
-          cat > "$D/src/StripInlineAsm.cpp" <<'EOF'
+          cat > "$STRIP_DIR/StripInlineAsm.cpp" <<'CPP'
           #include "StripInlineAsm.h"
           #include "llvm/ADT/Triple.h"
           #include "llvm/IR/InlineAsm.h"
           #include "llvm/IR/IRBuilder.h"
+          #include "llvm/IR/Module.h"
           #include "llvm/Support/raw_ostream.h"
-      
           using namespace llvm;
       
           PreservedAnalyses StripInlineAsmPass::run(Module &M, ModuleAnalysisManager &) {
             Triple TT(M.getTargetTriple());
-            // Chỉ strip khi KHÔNG phải x86/x86_64
+            // Giữ inline asm nếu target là x86/x64
             if (TT.isX86()) {
               errs() << "[StripInlineAsm] target is x86 — keep inline asm\n";
               return PreservedAnalyses::all();
             }
-      
             errs() << "[StripInlineAsm] running on target " << TT.str() << "\n";
-      
             bool Changed = false;
       
-            // 1) Module-level inline asm
+            // 1) Xoá module-level inline asm
             if (!M.getModuleInlineAsm().empty()) {
               errs() << "[StripInlineAsm] cleared module inline asm (size="
                      << (unsigned)M.getModuleInlineAsm().size() << ")\n";
@@ -126,16 +151,15 @@ jobs:
               Changed = true;
             }
       
-            // 2) CallBase -> InlineAsm trong function
+            // 2) Xoá các call InlineAsm trong function
             for (Function &F : M) {
               for (auto &BB : F) {
-                for (auto II = BB.begin(), IE = BB.end(); II != IE; ) {
-                  Instruction *I = &*II++;
-                  if (auto *CB = dyn_cast<CallBase>(I)) {
+                for (auto I = BB.begin(), E = BB.end(); I != E;) {
+                  Instruction *Inst = &*I++;
+                  if (auto *CB = dyn_cast<CallBase>(Inst)) {
                     Value *Callee = CB->getCalledOperand()->stripPointerCasts();
                     if (isa<InlineAsm>(Callee)) {
-                      errs() << "[StripInlineAsm] remove inline asm call in "
-                             << F.getName() << "\n";
+                      errs() << "[StripInlineAsm] remove inline asm call in " << F.getName() << "\n";
                       if (!CB->getType()->isVoidTy())
                         CB->replaceAllUsesWith(UndefValue::get(CB->getType()));
                       CB->eraseFromParent();
@@ -145,21 +169,47 @@ jobs:
                 }
               }
             }
-      
             return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
           }
-          EOF
+          CPP
       
-          #### 3) Gắn vào CMake
-          cmake_file="$D/CMakeLists.txt"
-          grep -q 'StripInlineAsm.cpp' "$cmake_file" || {
-            {
-              echo ''
-              echo '# Auto: add StripInlineAsm sources'
-              echo 'target_sources(SsageObfuscator PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/StripInlineAsm.cpp)'
-              echo 'target_include_directories(SsageObfuscator PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)'
-            } >> "$cmake_file"
+          cat > "$STRIP_DIR/Register.cpp" <<'CPP'
+          #include "StripInlineAsm.h"
+          #include "llvm/Passes/PassBuilder.h"
+          #include "llvm/Passes/PassPlugin.h"
+          using namespace llvm;
+      
+          extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
+            return {
+              LLVM_PLUGIN_API_VERSION, "StripInlineAsm", "1.0",
+              [](PassBuilder &PB) {
+                // Đầu pipeline
+                PB.registerPipelineStartEPCallback(
+                  [](ModulePassManager &MPM, OptimizationLevel) {
+                    MPM.addPass(StripInlineAsmPass());
+                  });
+                // Cuối pipeline
+                PB.registerOptimizerLastEPCallback(
+                  [](ModulePassManager &MPM, OptimizationLevel) {
+                    MPM.addPass(StripInlineAsmPass());
+                  });
+              }
+            };
           }
+          CPP
+  
+          cmake -S "$STRIP_DIR" -B "$STRIP_DIR/build" -G Ninja \
+            -DLLVM_DIR="/usr/lib/llvm-14/lib/cmake/llvm" \
+            -DCMAKE_C_COMPILER=clang-14 \
+            -DCMAKE_CXX_COMPILER="$HOST_CLANGXX" \
+            -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -Wl,-rpath,/usr/lib -Wl,-rpath,/usr/lib/llvm-14/lib" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Terminfo=ON \
+            -DCMAKE_DISABLE_FIND_PACKAGE_FFI=ON
+      
+          cmake --build "$STRIP_DIR/build" -j"$(nproc)"
+          echo "strip_plugin=$STRIP_DIR/build/libStripInlineAsm.so" >> "$GITHUB_OUTPUT"
+
       
           #### 4) Ép đăng ký vào PMRegistration.cpp (đầu và cuối pipeline)
           f="$D/src/PMRegistration.cpp"
