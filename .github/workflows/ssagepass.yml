@@ -703,7 +703,6 @@ jobs:
           cat > test_max.cpp <<'EOF'
           #include <cstdio>
           __attribute__((noinline))
-          __attribute((__annotate__(("split mba funcwrap vmf"))))
           static void ultra(){ std::puts("NDK MAX obf (annotated)"); }
       
           __attribute__((noinline))
