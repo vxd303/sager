@@ -191,7 +191,25 @@ jobs:
 
           echo "=== HEAD (sanitized) ==="
           nl -ba "$D/CMakeLists.txt" | sed -n '1,160p' || true
-     
+      - name: Patch Utils.cpp (LLVM14 Demote* expects Instruction*)
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+          F="$D/src/Utils.cpp"
+          test -f "$F" || { echo "::error::Utils.cpp not found"; exit 1; }
+
+          # Đảm bảo có <optional>
+          grep -qE '^[[:space:]]*#include <optional>' "$F" || sed -i '1i #include <optional>' "$F"
+
+          # DemotePHIToStack(PN, insertPoint) --> DemotePHIToStack(PN, insertPoint ? &*insertPoint.value() : nullptr)
+          perl -0777 -pe 's/DemotePHIToStack\s*\(\s*PN\s*,\s*insertPoint\s*\)/DemotePHIToStack(PN, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$F"
+
+          # DemoteRegToStack(*I, false, insertPoint) --> DemoteRegToStack(*I, false, insertPoint ? &*insertPoint.value() : nullptr)
+          perl -0777 -pe 's/DemoteRegToStack\s*\(\s*\*I\s*,\s*false\s*,\s*insertPoint\s*\)/DemoteRegToStack(*I, false, insertPoint ? \&\*insertPoint.value() : nullptr)/g' -i "$F"
+
+          echo "=== Context around patched lines ==="
+          nl -ba "$F" | sed -n '150,210p'
+
       - name: Configure (host LLVM14)
         env:
           LLVM_DIR: ${{ env.HOST_LLVM_DIR }}
