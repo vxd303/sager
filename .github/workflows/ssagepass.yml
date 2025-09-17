@@ -79,11 +79,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-      
+          : "${D:="$GITHUB_WORKSPACE/third_party/SsagePass/Obfuscation"}"
+          : "${NDK:=/opt/hostedtoolcache/ndk/r25c/x64}"
+          : "${GITHUB_OUTPUT:="${RUNNER_TEMP:-/tmp}/gh_out.txt"}"
+    
           ROOT="$GITHUB_WORKSPACE"
           STRIP_DIR="$ROOT/stripper"
-          mkdir -p "$STRIP_DIR"
-      
+          mkdir -p "$STRIP_DIR"          
+
           # --- Chọn compiler C++ khả dụng ---
           NDK=/opt/hostedtoolcache/ndk/r25c/x64
           CAND="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
