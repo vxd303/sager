@@ -564,6 +564,165 @@ jobs:
           echo "Built bitcode:"
           ls -l "$HOME/.ollvm/crypto_runtime.bc" ./crypto_runtime.bc
 
+      # 1) Build plugin 'stripper' – xoá inline asm
+      - name: Build strip-inline-asm plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          STRIP_DIR="$ROOT/stripper"
+          mkdir -p "$STRIP_DIR"
+          cat > "$STRIP_DIR/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.13)
+          project(StripInlineAsm LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          find_package(LLVM 14 REQUIRED CONFIG)
+          include_directories(${LLVM_INCLUDE_DIRS})
+          add_definitions(${LLVM_DEFINITIONS})
+          add_library(StripInlineAsm MODULE
+            StripInlineAsm.cpp
+            Register.cpp
+          )
+          target_compile_definitions(StripInlineAsm PRIVATE -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS)
+          target_include_directories(StripInlineAsm PRIVATE ${LLVM_INCLUDE_DIRS})
+          if (NOT LLVM_ENABLE_RTTI)
+            target_compile_options(StripInlineAsm PRIVATE -fno-rtti)
+          endif()
+          set_target_properties(StripInlineAsm PROPERTIES
+            OUTPUT_NAME "StripInlineAsm"
+            PREFIX "lib"
+          )
+          CMAKE
+      
+          cat > "$STRIP_DIR/StripInlineAsm.h" <<'HDR'
+          #pragma once
+          #include "llvm/IR/PassManager.h"
+          namespace llvm {
+          class StripInlineAsmPass : public PassInfoMixin<StripInlineAsmPass> {
+          public:
+            PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
+          };
+          } // namespace llvm
+          HDR
+      
+          cat > "$STRIP_DIR/StripInlineAsm.cpp" <<'CPP'
+          #include "StripInlineAsm.h"
+          #include "llvm/ADT/Triple.h"
+          #include "llvm/IR/InlineAsm.h"
+          #include "llvm/IR/IRBuilder.h"
+          #include "llvm/IR/Module.h"
+          #include "llvm/Support/raw_ostream.h"
+          using namespace llvm;
+      
+          PreservedAnalyses StripInlineAsmPass::run(Module &M, ModuleAnalysisManager &) {
+            Triple TT(M.getTargetTriple());
+            // Chỉ strip khi KHÔNG phải x86/x64
+            if (TT.isX86()) {
+              errs() << "[StripInlineAsm] target is x86 — keep inline asm\n";
+              return PreservedAnalyses::all();
+            }
+      
+            errs() << "[StripInlineAsm] running on target " << TT.str() << "\n";
+            bool Changed = false;
+      
+            // 1) Xoá module-level inline asm (đây thường là chỗ phát sinh 'movq %rbp, x8')
+            if (!M.getModuleInlineAsm().empty()) {
+              errs() << "[StripInlineAsm] cleared module inline asm (size="
+                     << (unsigned)M.getModuleInlineAsm().size() << ")\n";
+              M.setModuleInlineAsm("");
+              Changed = true;
+            }
+      
+            // 2) Xoá mọi call InlineAsm trong function
+            for (Function &F : M) {
+              for (auto &BB : F) {
+                for (auto I = BB.begin(), E = BB.end(); I != E;) {
+                  Instruction *Inst = &*I++;
+                  if (auto *CB = dyn_cast<CallBase>(Inst)) {
+                    Value *Callee = CB->getCalledOperand()->stripPointerCasts();
+                    if (isa<InlineAsm>(Callee)) {
+                      errs() << "[StripInlineAsm] remove inline asm call in " << F.getName() << "\n";
+                      if (!CB->getType()->isVoidTy())
+                        CB->replaceAllUsesWith(UndefValue::get(CB->getType()));
+                      CB->eraseFromParent();
+                      Changed = true;
+                    }
+                  }
+                }
+              }
+            }
+      
+            return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+          }
+          CPP
+      
+          cat > "$STRIP_DIR/Register.cpp" <<'CPP'
+          #include "StripInlineAsm.h"
+          #include "llvm/Passes/PassBuilder.h"
+          #include "llvm/Passes/PassPlugin.h"
+          using namespace llvm;
+      
+          extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
+            return {
+              LLVM_PLUGIN_API_VERSION, "StripInlineAsm", "1.0",
+              [](PassBuilder &PB) {
+                // Đăng ký ở ĐẦU pipeline
+                PB.registerPipelineStartEPCallback(
+                  [](ModulePassManager &MPM, OptimizationLevel) {
+                    MPM.addPass(StripInlineAsmPass());
+                  });
+      
+                // Đăng ký ở CUỐI pipeline (sau mọi obfuscation khác)
+                PB.registerOptimizerLastEPCallback(
+                  [](ModulePassManager &MPM, OptimizationLevel) {
+                    MPM.addPass(StripInlineAsmPass());
+                  });
+              }
+            };
+          }
+          CPP
+      
+          cmake -S "$STRIP_DIR" -B "$STRIP_DIR/build" \
+            -G Ninja -DLLVM_DIR="/usr/lib/llvm-14/lib/cmake/llvm"
+          cmake --build "$STRIP_DIR/build" -j"$(nproc)"
+      
+          echo "strip_plugin=$STRIP_DIR/build/libStripInlineAsm.so" >> "$GITHUB_OUTPUT"
+      
+      # 2) Biên dịch test với CẢ HAI plugin
+      - name: NDK test with both plugins (Ssage + strip)
+        shell: bash
+        env:
+          PLUGIN: build/libSsageObfuscator.so
+          STRIP_PLUGIN: ${{ steps.build-strip-inline-asm-plugin.outputs.strip_plugin || 'stripper/build/libStripInlineAsm.so' }}
+        run: |
+          set -euo pipefail
+          NDK="/opt/hostedtoolcache/ndk/r25c/x64"
+          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          "$CXX" --version
+      
+          cat > test_max.cpp <<'EOF'
+          #include <cstdio>
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr icall"))))
+          static void ultra(){ std::puts("NDK MAX obf (annotated)"); }
+      
+          __attribute__((noinline))
+          __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf indibr icall"))))
+          static void ultra2(){ std::puts("NDK MAX obf 2 (annotated)"); }
+      
+          int main(){ ultra(); ultra2(); return 0; }
+          EOF
+      
+          # NẠP 2 PLUGIN — tụi nó đều hook PB, pass strip sẽ chạy ở đầu/cuối
+          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
+            -fpass-plugin="$PLUGIN" \
+            -fpass-plugin="$STRIP_PLUGIN" \
+            -c test_max.cpp -o test_max.o
+      
+          "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
+          file libtest_max.so || true
+
       - name: NDK compile test — annotations (NEW PM, -O0)
         run: |
           set -euxo pipefail
