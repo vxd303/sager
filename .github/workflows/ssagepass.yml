@@ -379,7 +379,7 @@ jobs:
           # Paths
           OUT_DIR="$HOME/.ollvm"
           CRYPTO_CPP="$D/src/crypto_runtime.cpp"
-          B3_DIR="$D/blake3"
+          B3_DIR="$D/black3"
           B3_INC="-I$B3_DIR"
           INC="-I$D/include $B3_INC"
       
