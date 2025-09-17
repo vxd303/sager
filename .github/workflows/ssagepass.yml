@@ -210,6 +210,41 @@ jobs:
           echo "=== Context around patched lines ==="
           nl -ba "$F" | sed -n '150,210p'
 
+      - name: Patch BogusControlFlow & VMFlatten for LLVM14 (iterator vs Instruction*)
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"
+      
+          # ---- BogusControlFlow.cpp ----
+          F="$D/src/BogusControlFlow.cpp"
+          if [ -f "$F" ]; then
+            # 1) BinaryOperator::Create(..., InsertBefore->getIterator()) -> InsertBefore (Instruction*)
+            perl -0777 -pe 's/(\bBinaryOperator::Create\([^;]*?),\s*InsertBefore->getIterator\(\)\s*\)/$1, InsertBefore)/g' -i "$F"
+      
+            # 2) So sánh với begin()/end(): đổi Instruction* sang iterator bằng ->getIterator()
+            perl -0777 -pe 's/getFirstNonPHIOrDbgOrLifetime\(\)\s*(==|!=)\s*([A-Za-z_][A-Za-z0-9_\->]*)\bend\(\)/getFirstNonPHIOrDbgOrLifetime()->getIterator() $1 \2end()/g' -i "$F"
+            perl -0777 -pe 's/getFirstNonPHIOrDbgOrLifetime\(\)\s*(==|!=)\s*([A-Za-z_][A-Za-z0-9_\->]*)\bbegin\(\)/getFirstNonPHIOrDbgOrLifetime()->getIterator() $1 \2begin()/g' -i "$F"
+      
+            # 3) Gán iterator từ Instruction*: thêm ->getIterator();
+            perl -0777 -pe 's/(\b[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*->\s*getFirstNonPHIOrDbgOrLifetime\(\))\s*;/\1->getIterator();/g' -i "$F"
+      
+            echo "=== BogusControlFlow.cpp (context) ==="
+            nl -ba "$F" | sed -n '100,140p'
+            nl -ba "$F" | sed -n '340,380p'
+          fi
+      
+          # ---- VMFlatten.cpp ----
+          F="$D/src/VMFlatten.cpp"
+          if [ -f "$F" ]; then
+            # DemotePHIToStack(phi, insertionPoint) -> DemotePHIToStack(phi, &*insertionPoint)
+            perl -0777 -pe 's/DemotePHIToStack\s*\(\s*([^\),]+)\s*,\s*insertionPoint\s*\)/DemotePHIToStack(\1, \&*insertionPoint)/g' -i "$F"
+            # (nếu có) DemoteRegToStack(..., false, insertionPoint) -> ... , &*insertionPoint)
+            perl -0777 -pe 's/DemoteRegToStack\s*\(\s*([^\),]+)\s*,\s*false\s*,\s*insertionPoint\s*\)/DemoteRegToStack(\1, false, \&*insertionPoint)/g' -i "$F"
+      
+            echo "=== VMFlatten.cpp (context) ==="
+            nl -ba "$F" | sed -n '810,840p'
+          fi
+
       - name: Configure (host LLVM14)
         env:
           LLVM_DIR: ${{ env.HOST_LLVM_DIR }}
