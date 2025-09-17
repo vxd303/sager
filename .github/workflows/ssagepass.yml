@@ -686,41 +686,7 @@ jobs:
       
           cmake --build "$STRIP_DIR/build" -j"$(nproc)"
           echo "strip_plugin=$STRIP_DIR/build/libStripInlineAsm.so" >> "$GITHUB_OUTPUT"
-
-      
-      # 2) Biên dịch test với CẢ HAI plugin
-      - name: NDK test with both plugins (Ssage + strip)
-        shell: bash
-        env:
-          PLUGIN: build/libSsageObfuscator.so
-          STRIP_PLUGIN: ${{ steps.build-strip-inline-asm-plugin.outputs.strip_plugin || 'stripper/build/libStripInlineAsm.so' }}
-        run: |
-          set -euo pipefail
-          NDK="/opt/hostedtoolcache/ndk/r25c/x64"
-          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
-          "$CXX" --version
-      
-          cat > test_max.cpp <<'EOF'
-          #include <cstdio>
-          __attribute__((noinline))
-          __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf"))))
-          static void ultra(){ std::puts("NDK MAX obf (annotated)"); }
-      
-          __attribute__((noinline))
-          __attribute((__annotate__(("fla enfla split strenc bcf mba funcwrap vmf"))))
-          static void ultra2(){ std::puts("NDK MAX obf 2 (annotated)"); }
-      
-          int main(){ ultra(); ultra2(); return 0; }
-          EOF
-      
-          # NẠP 2 PLUGIN — tụi nó đều hook PB, pass strip sẽ chạy ở đầu/cuối
-          "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
-            -fpass-plugin="$PLUGIN" \
-            -c test_max.cpp -o test_max.o
-      
-          "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
-          file libtest_max.so || true
-
+          
       - name: NDK compile test — annotations (NEW PM, -O0)
         run: |
           set -euxo pipefail
