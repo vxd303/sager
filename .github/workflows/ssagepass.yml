@@ -351,6 +351,13 @@ jobs:
             echo ">> xchacha symbol already resolved; skip fallback."
           fi
 
+      - name: Setup NDK r25c
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
       - name: Provide crypto_runtime.bc for StringEncryption
         shell: bash
         run: |
@@ -383,13 +390,6 @@ jobs:
           fi
       
           ls -l "$HOME/.ollvm/crypto_runtime.bc"
-
-      - name: Setup NDK r25c
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r25c
-          add-to-path: true
 
       - name: NDK compile test — annotations (NEW PM, -O0)
         run: |
