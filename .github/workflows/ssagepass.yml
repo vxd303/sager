@@ -75,16 +75,16 @@ jobs:
             grep -qE '^[[:space:]]*#include <optional>' "$f" || sed -i '1i #include <optional>' "$f"
           done
 
-      - name: Patch SsagePass to strip inline asm on non-x86
+      - name: Force-strip x86 inline asm on non-x86 targets (AArch64)
         shell: bash
         run: |
           set -euo pipefail
           D="$GITHUB_WORKSPACE/third_party/SsagePass/Obfuscation"
-          test -d "$D" || { echo "::error::SsagePass/Obfuscation not found at $D"; exit 1; }
+          test -d "$D" || { echo "::error::Not found: $D"; exit 1; }
       
           mkdir -p "$D/include" "$D/src"
       
-          #### 1) Add header ####
+          #### 1) Header
           cat > "$D/include/StripInlineAsm.h" <<'EOF'
           #pragma once
           #include "llvm/IR/PassManager.h"
@@ -96,38 +96,46 @@ jobs:
           } // namespace llvm
           EOF
       
-          #### 2) Add implementation ####
+          #### 2) Implementation (có log)
           cat > "$D/src/StripInlineAsm.cpp" <<'EOF'
           #include "StripInlineAsm.h"
           #include "llvm/ADT/Triple.h"
           #include "llvm/IR/InlineAsm.h"
           #include "llvm/IR/IRBuilder.h"
+          #include "llvm/Support/raw_ostream.h"
       
           using namespace llvm;
       
           PreservedAnalyses StripInlineAsmPass::run(Module &M, ModuleAnalysisManager &) {
             Triple TT(M.getTargetTriple());
-            // Chỉ giữ inline-asm cho x86/x86_64. Các target khác (AArch64, ARM, ...) sẽ strip.
-            if (TT.isX86())
+            // Chỉ strip khi KHÔNG phải x86/x86_64
+            if (TT.isX86()) {
+              errs() << "[StripInlineAsm] target is x86 — keep inline asm\n";
               return PreservedAnalyses::all();
+            }
+      
+            errs() << "[StripInlineAsm] running on target " << TT.str() << "\n";
       
             bool Changed = false;
       
-            // 1) Xoá module-level inline asm
+            // 1) Module-level inline asm
             if (!M.getModuleInlineAsm().empty()) {
+              errs() << "[StripInlineAsm] cleared module inline asm (size="
+                     << (unsigned)M.getModuleInlineAsm().size() << ")\n";
               M.setModuleInlineAsm("");
               Changed = true;
             }
       
-            // 2) Xoá mọi CallBase gọi InlineAsm trong function
+            // 2) CallBase -> InlineAsm trong function
             for (Function &F : M) {
-              for (auto BI = F.begin(), BE = F.end(); BI != BE; ) {
-                BasicBlock &BB = *BI++;
+              for (auto &BB : F) {
                 for (auto II = BB.begin(), IE = BB.end(); II != IE; ) {
                   Instruction *I = &*II++;
                   if (auto *CB = dyn_cast<CallBase>(I)) {
                     Value *Callee = CB->getCalledOperand()->stripPointerCasts();
                     if (isa<InlineAsm>(Callee)) {
+                      errs() << "[StripInlineAsm] remove inline asm call in "
+                             << F.getName() << "\n";
                       if (!CB->getType()->isVoidTy())
                         CB->replaceAllUsesWith(UndefValue::get(CB->getType()));
                       CB->eraseFromParent();
@@ -142,39 +150,44 @@ jobs:
           }
           EOF
       
-          #### 3) Wire up CMake ####
+          #### 3) Gắn vào CMake
           cmake_file="$D/CMakeLists.txt"
-          # Thêm nguồn và include nếu chưa có
           grep -q 'StripInlineAsm.cpp' "$cmake_file" || {
-            printf '\n# Auto: add StripInlineAsm files\n' >> "$cmake_file"
-            printf 'target_sources(SsageObfuscator PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/StripInlineAsm.cpp)\n' >> "$cmake_file"
-          }
-          grep -q 'include/StripInlineAsm.h' "$cmake_file" || {
-            printf 'target_include_directories(SsageObfuscator PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)\n' >> "$cmake_file"
+            {
+              echo ''
+              echo '# Auto: add StripInlineAsm sources'
+              echo 'target_sources(SsageObfuscator PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/StripInlineAsm.cpp)'
+              echo 'target_include_directories(SsageObfuscator PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)'
+            } >> "$cmake_file"
           }
       
-          #### 4) Inject registration into PMRegistration.cpp ####
+          #### 4) Ép đăng ký vào PMRegistration.cpp (đầu và cuối pipeline)
           f="$D/src/PMRegistration.cpp"
-          test -f "$f" || { echo "::error::PMRegistration.cpp not found at $f"; exit 1; }
+          test -f "$f" || { echo "::error::PMRegistration.cpp not found: $f"; exit 1; }
       
-          # Bổ sung include nếu thiếu
+          # Bổ sung include
           grep -q 'StripInlineAsm.h' "$f" || \
-            perl -0777 -i -pe 's/#include\s*<llvm\/Passes\/PassBuilder\.h>\n/#include <llvm\/Passes\/PassBuilder.h>\n#include "StripInlineAsm.h"\n/s' "$f"
+            perl -0777 -i -pe 's/#include\s*<llvm\/Passes\/PassBuilder\.h>\s*\n/#include <llvm\/Passes\/PassBuilder.h>\n#include "StripInlineAsm.h"\n/s' "$f"
       
-          # Thêm callback chạy cuối pipeline nếu chưa có
+          # Chèn 2 callback ngay SAU khi mở ngoặc của lambda có tham số PassBuilder& PB
+          # (dùng 2 lần re để tăng độ bền với format khác nhau).
           perl -0777 -i -pe '
-            if ($_ !~ /StripInlineAsmPass\(\)/) {
-              # Cố gắng chèn trước khi đóng lambda của các EP callback hiện có
-              s/(PB\.register[^\n]*?;\s*(?:.|\n)*?)(\n\s*\}\s*\)\s*;)/$1\n    PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM, OptimizationLevel){ MPM.addPass(StripInlineAsmPass()); });\n$2/s
-              or
-              s/(PassBuilder\s*&\s*PB[^\{]*\{)/$1\n    PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM, OptimizationLevel){ MPM.addPass(StripInlineAsmPass()); });\n/s;
-            }
+            my $add = qq{
+              PB.registerPipelineStartEPCallback([](ModulePassManager &MPM, OptimizationLevel){
+                MPM.addPass(StripInlineAsmPass());
+              });
+              PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM, OptimizationLevel){
+                MPM.addPass(StripInlineAsmPass());
+              });
+            };
+            s/(\(\s*PassBuilder\s*&\s*PB\s*\)\s*\{)/$1\n$add/s or
+            s/(\[\s*\]\s*\(\s*PassBuilder\s*&\s*PB\s*\)\s*\{)/$1\n$add/s;
             $_;
           ' "$f"
       
-          echo "== Sanity check =="
-          grep -n 'StripInlineAsm' "$f" || true
-          grep -n 'StripInlineAsm' "$cmake_file" || true
+          echo "== verify insert =="
+          grep -n 'StripInlineAsmPass' "$f" || true
+          grep -n 'StripInlineAsm.cpp' "$cmake_file" || true
 
       # >>>>>>>>>>>>>>>>>>>> QUAN TRỌNG: thay PMRegistration.cpp cho NPM <<<<<<<<<<<<<<<<<<<<
       - name: Replace PMRegistration.cpp (register passes in NPM)
