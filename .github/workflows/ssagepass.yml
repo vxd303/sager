@@ -572,9 +572,11 @@ jobs:
           ROOT="$GITHUB_WORKSPACE"
           STRIP_DIR="$ROOT/stripper"
           mkdir -p "$STRIP_DIR"
+      
           cat > "$STRIP_DIR/CMakeLists.txt" <<'CMAKE'
           cmake_minimum_required(VERSION 3.13)
-          project(StripInlineAsm LANGUAGES CXX)
+          project(StripInlineAsm LANGUAGES C CXX)
+          enable_language(C)
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
           find_package(LLVM 14 REQUIRED CONFIG)
@@ -617,16 +619,13 @@ jobs:
       
           PreservedAnalyses StripInlineAsmPass::run(Module &M, ModuleAnalysisManager &) {
             Triple TT(M.getTargetTriple());
-            // Chỉ strip khi KHÔNG phải x86/x64
             if (TT.isX86()) {
               errs() << "[StripInlineAsm] target is x86 — keep inline asm\n";
               return PreservedAnalyses::all();
             }
-      
             errs() << "[StripInlineAsm] running on target " << TT.str() << "\n";
             bool Changed = false;
       
-            // 1) Xoá module-level inline asm (đây thường là chỗ phát sinh 'movq %rbp, x8')
             if (!M.getModuleInlineAsm().empty()) {
               errs() << "[StripInlineAsm] cleared module inline asm (size="
                      << (unsigned)M.getModuleInlineAsm().size() << ")\n";
@@ -634,7 +633,6 @@ jobs:
               Changed = true;
             }
       
-            // 2) Xoá mọi call InlineAsm trong function
             for (Function &F : M) {
               for (auto &BB : F) {
                 for (auto I = BB.begin(), E = BB.end(); I != E;) {
@@ -652,7 +650,6 @@ jobs:
                 }
               }
             }
-      
             return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
           }
           CPP
@@ -667,13 +664,10 @@ jobs:
             return {
               LLVM_PLUGIN_API_VERSION, "StripInlineAsm", "1.0",
               [](PassBuilder &PB) {
-                // Đăng ký ở ĐẦU pipeline
                 PB.registerPipelineStartEPCallback(
                   [](ModulePassManager &MPM, OptimizationLevel) {
                     MPM.addPass(StripInlineAsmPass());
                   });
-      
-                // Đăng ký ở CUỐI pipeline (sau mọi obfuscation khác)
                 PB.registerOptimizerLastEPCallback(
                   [](ModulePassManager &MPM, OptimizationLevel) {
                     MPM.addPass(StripInlineAsmPass());
@@ -683,11 +677,16 @@ jobs:
           }
           CPP
       
-          cmake -S "$STRIP_DIR" -B "$STRIP_DIR/build" \
-            -G Ninja -DLLVM_DIR="/usr/lib/llvm-14/lib/cmake/llvm"
-          cmake --build "$STRIP_DIR/build" -j"$(nproc)"
+          cmake -S "$STRIP_DIR" -B "$STRIP_DIR/build" -G Ninja \
+            -DLLVM_DIR="/usr/lib/llvm-14/lib/cmake/llvm" \
+            -DCMAKE_C_COMPILER=clang-14 \
+            -DCMAKE_CXX_COMPILER=clang-14 \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Terminfo=ON \
+            -DCMAKE_DISABLE_FIND_PACKAGE_FFI=ON
       
+          cmake --build "$STRIP_DIR/build" -j"$(nproc)"
           echo "strip_plugin=$STRIP_DIR/build/libStripInlineAsm.so" >> "$GITHUB_OUTPUT"
+
       
       # 2) Biên dịch test với CẢ HAI plugin
       - name: NDK test with both plugins (Ssage + strip)
