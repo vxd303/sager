@@ -406,6 +406,57 @@ jobs:
           }
           !msx
           ' "$F"
+      - name: Build crypto_runtime.bc (NDK toolchain, fix SYS_* redefines)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          D="${{ steps.detect.outputs.build_dir }}"   # Obfuscation dir
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CXX="$BIN/clang++"
+          CC="$BIN/clang"
+          LLVMLINK="$BIN/llvm-link"   # dùng llvm-link của NDK (14.0.7)
+      
+          # 1) Quấn các macro SYS_* loại "số nguyên" để không đè lên bản __NR_*
+          F="$D/src/crypto_runtime.cpp"
+          perl -0777 -i -pe '
+            s/^(\s*#\s*define\s+SYS_(WRITE|MPROTECT|UNLINKAT|READLINKAT|PTRACE)\s+\d+\s*)$
+             /#ifndef SYS_$2\n$1\n#endif\n/gmx
+          ' "$F"
+      
+          # (Nếu trước đó bạn có bước patch C++20->C++17 + direct_syscall() dùng ::syscall,
+          #  hãy giữ nguyên — không cần lặp lại ở đây.)
+      
+          # 2) Đường include cho headers
+          INC1="-I$D/include"
+          INC2="-I$D/blake3"
+      
+          # 3) Biên dịch từng phần sang LLVM bitcode bằng NDK 14.0.7
+          mkdir -p "$HOME/.ollvm"
+          "$CXX" --target=aarch64-linux-android31 -std=gnu++17 -O2 -fPIC -emit-llvm -c \
+            $INC1 $INC2 "$D/src/crypto_runtime.cpp" -o "$HOME/.ollvm/crypto_runtime_core.bc"
+      
+          "$CC"  --target=aarch64-linux-android31 -O2 -fPIC -emit-llvm -c $INC2 \
+            "$D/blake3/blake3.c"              -o "$HOME/.ollvm/blake3.c.bc"
+          "$CC"  --target=aarch64-linux-android31 -O2 -fPIC -emit-llvm -c $INC2 \
+            "$D/blake3/blake3_dispatch.c"     -o "$HOME/.ollvm/blake3_dispatch.c.bc"
+          "$CC"  --target=aarch64-linux-android31 -O2 -fPIC -emit-llvm -c $INC2 \
+            "$D/blake3/blake3_portable.c"     -o "$HOME/.ollvm/blake3_portable.c.bc"
+      
+          # 4) Link các .bc bằng llvm-link của NDK (đúng version)
+          "$LLVMLINK" \
+            "$HOME/.ollvm/crypto_runtime_core.bc" \
+            "$HOME/.ollvm/blake3.c.bc" \
+            "$HOME/.ollvm/blake3_dispatch.c.bc" \
+            "$HOME/.ollvm/blake3_portable.c.bc" \
+            -o "$HOME/.ollvm/crypto_runtime.bc"
+      
+          # 5) Một số plugin còn dò cả ở CWD → tạo symlink cho chắc
+          ln -sf "$HOME/.ollvm/crypto_runtime.bc" ./crypto_runtime.bc
+      
+          echo "Built bitcode:"
+          ls -l "$HOME/.ollvm/crypto_runtime.bc" ./crypto_runtime.bc
+
       - name: Build crypto_runtime.bc (with BLAKE3 portable)
         shell: bash
         run: |
