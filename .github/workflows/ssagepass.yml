@@ -716,7 +716,6 @@ jobs:
           # NẠP 2 PLUGIN — tụi nó đều hook PB, pass strip sẽ chạy ở đầu/cuối
           "$CXX" --target=aarch64-linux-android31 -O0 -fPIC \
             -fpass-plugin="$PLUGIN" \
-            -fpass-plugin="$STRIP_PLUGIN" \
             -c test_max.cpp -o test_max.o
       
           "$CXX" --target=aarch64-linux-android31 test_max.o -shared -o libtest_max.so
